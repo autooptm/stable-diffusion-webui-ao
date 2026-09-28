@@ -3,7 +3,7 @@ import contextlib
 from functools import lru_cache
 
 import torch
-from modules import errors, shared, npu_specific
+from modules import errors, shared, npu_specific, sd_opt
 
 if sys.platform == "darwin":
     from modules import mac_specific
@@ -103,7 +103,7 @@ def enable_tf32():
 
         # enabling benchmark option seems to enable a range of cards to do fp16 when they otherwise can't
         # see https://github.com/AUTOMATIC1111/stable-diffusion-webui/pull/4407
-        if cuda_no_autocast():
+        if cuda_no_autocast() or sd_opt.enabled("OPT_4", default="0"):
             torch.backends.cudnn.benchmark = True
 
         torch.backends.cuda.matmul.allow_tf32 = True

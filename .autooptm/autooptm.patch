@@ -1,0 +1,2784 @@
+diff --git a/modules/api/api.py b/modules/api/api.py
+index 97ec751..04af384 100644
+--- a/modules/api/api.py
++++ b/modules/api/api.py
+@@ -18,6 +18,7 @@ from secrets import compare_digest
+ 
+ import modules.shared as shared
+ from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, postprocessing, errors, restart, shared_items, script_callbacks, infotext_utils, sd_models, sd_schedulers
++from modules import sd_opt
+ from modules.api import models
+ from modules.shared import opts
+ from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img, process_images
+@@ -110,7 +111,7 @@ def encode_pil_to_base64(image):
+                 if isinstance(key, str) and isinstance(value, str):
+                     metadata.add_text(key, value)
+                     use_metadata = True
+-            image.save(output_bytes, format="PNG", pnginfo=(metadata if use_metadata else None), quality=opts.jpeg_quality)
++            image.save(output_bytes, format="PNG", pnginfo=(metadata if use_metadata else None), quality=opts.jpeg_quality, compress_level=sd_opt.png_compress_level())
+ 
+         elif opts.samples_format.lower() in ("jpg", "jpeg", "webp"):
+             if image.mode in ("RGBA", "P"):
+diff --git a/modules/devices.py b/modules/devices.py
+index ee67914..35169df 100644
+--- a/modules/devices.py
++++ b/modules/devices.py
+@@ -3,7 +3,7 @@ import contextlib
+ from functools import lru_cache
+ 
+ import torch
+-from modules import errors, shared, npu_specific
++from modules import errors, shared, npu_specific, sd_opt
+ 
+ if sys.platform == "darwin":
+     from modules import mac_specific
+@@ -103,7 +103,7 @@ def enable_tf32():
+ 
+         # enabling benchmark option seems to enable a range of cards to do fp16 when they otherwise can't
+         # see https://github.com/AUTOMATIC1111/stable-diffusion-webui/pull/4407
+-        if cuda_no_autocast():
++        if cuda_no_autocast() or sd_opt.enabled("OPT_4", default="0"):
+             torch.backends.cudnn.benchmark = True
+ 
+         torch.backends.cuda.matmul.allow_tf32 = True
+diff --git a/modules/sd_hijack.py b/modules/sd_hijack.py
+index 0de8305..cf555e9 100644
+--- a/modules/sd_hijack.py
++++ b/modules/sd_hijack.py
+@@ -1,409 +1,411 @@
+-import torch
+-from torch.nn.functional import silu
+-from types import MethodType
+-
+-from modules import devices, sd_hijack_optimizations, shared, script_callbacks, errors, sd_unet, patches
+-from modules.hypernetworks import hypernetwork
+-from modules.shared import cmd_opts
+-from modules import sd_hijack_clip, sd_hijack_open_clip, sd_hijack_unet, sd_hijack_xlmr, xlmr, xlmr_m18
+-
+-import ldm.modules.attention
+-import ldm.modules.diffusionmodules.model
+-import ldm.modules.diffusionmodules.openaimodel
+-import ldm.models.diffusion.ddpm
+-import ldm.models.diffusion.ddim
+-import ldm.models.diffusion.plms
+-import ldm.modules.encoders.modules
+-
+-import sgm.modules.attention
+-import sgm.modules.diffusionmodules.model
+-import sgm.modules.diffusionmodules.openaimodel
+-import sgm.modules.encoders.modules
+-
+-attention_CrossAttention_forward = ldm.modules.attention.CrossAttention.forward
+-diffusionmodules_model_nonlinearity = ldm.modules.diffusionmodules.model.nonlinearity
+-diffusionmodules_model_AttnBlock_forward = ldm.modules.diffusionmodules.model.AttnBlock.forward
+-
+-# new memory efficient cross attention blocks do not support hypernets and we already
+-# have memory efficient cross attention anyway, so this disables SD2.0's memory efficient cross attention
+-ldm.modules.attention.MemoryEfficientCrossAttention = ldm.modules.attention.CrossAttention
+-ldm.modules.attention.BasicTransformerBlock.ATTENTION_MODES["softmax-xformers"] = ldm.modules.attention.CrossAttention
+-
+-# silence new console spam from SD2
+-ldm.modules.attention.print = shared.ldm_print
+-ldm.modules.diffusionmodules.model.print = shared.ldm_print
+-ldm.util.print = shared.ldm_print
+-ldm.models.diffusion.ddpm.print = shared.ldm_print
+-
+-optimizers = []
+-current_optimizer: sd_hijack_optimizations.SdOptimization = None
+-
+-ldm_patched_forward = sd_unet.create_unet_forward(ldm.modules.diffusionmodules.openaimodel.UNetModel.forward)
+-ldm_original_forward = patches.patch(__file__, ldm.modules.diffusionmodules.openaimodel.UNetModel, "forward", ldm_patched_forward)
+-
+-sgm_patched_forward = sd_unet.create_unet_forward(sgm.modules.diffusionmodules.openaimodel.UNetModel.forward)
+-sgm_original_forward = patches.patch(__file__, sgm.modules.diffusionmodules.openaimodel.UNetModel, "forward", sgm_patched_forward)
+-
+-
+-def list_optimizers():
+-    new_optimizers = script_callbacks.list_optimizers_callback()
+-
+-    new_optimizers = [x for x in new_optimizers if x.is_available()]
+-
+-    new_optimizers = sorted(new_optimizers, key=lambda x: x.priority, reverse=True)
+-
+-    optimizers.clear()
+-    optimizers.extend(new_optimizers)
+-
+-
+-def apply_optimizations(option=None):
+-    global current_optimizer
+-
+-    undo_optimizations()
+-
+-    if len(optimizers) == 0:
+-        # a script can access the model very early, and optimizations would not be filled by then
+-        current_optimizer = None
+-        return ''
+-
+-    ldm.modules.diffusionmodules.model.nonlinearity = silu
+-    ldm.modules.diffusionmodules.openaimodel.th = sd_hijack_unet.th
+-
+-    sgm.modules.diffusionmodules.model.nonlinearity = silu
+-    sgm.modules.diffusionmodules.openaimodel.th = sd_hijack_unet.th
+-
+-    if current_optimizer is not None:
+-        current_optimizer.undo()
+-        current_optimizer = None
+-
+-    selection = option or shared.opts.cross_attention_optimization
+-    if selection == "Automatic" and len(optimizers) > 0:
+-        matching_optimizer = next(iter([x for x in optimizers if x.cmd_opt and getattr(shared.cmd_opts, x.cmd_opt, False)]), optimizers[0])
+-    else:
+-        matching_optimizer = next(iter([x for x in optimizers if x.title() == selection]), None)
+-
+-    if selection == "None":
+-        matching_optimizer = None
+-    elif selection == "Automatic" and shared.cmd_opts.disable_opt_split_attention:
+-        matching_optimizer = None
+-    elif matching_optimizer is None:
+-        matching_optimizer = optimizers[0]
+-
+-    if matching_optimizer is not None:
+-        print(f"Applying attention optimization: {matching_optimizer.name}... ", end='')
+-        matching_optimizer.apply()
+-        print("done.")
+-        current_optimizer = matching_optimizer
+-        return current_optimizer.name
+-    else:
+-        print("Disabling attention optimization")
+-        return ''
+-
+-
+-def undo_optimizations():
+-    ldm.modules.diffusionmodules.model.nonlinearity = diffusionmodules_model_nonlinearity
+-    ldm.modules.attention.CrossAttention.forward = hypernetwork.attention_CrossAttention_forward
+-    ldm.modules.diffusionmodules.model.AttnBlock.forward = diffusionmodules_model_AttnBlock_forward
+-
+-    sgm.modules.diffusionmodules.model.nonlinearity = diffusionmodules_model_nonlinearity
+-    sgm.modules.attention.CrossAttention.forward = hypernetwork.attention_CrossAttention_forward
+-    sgm.modules.diffusionmodules.model.AttnBlock.forward = diffusionmodules_model_AttnBlock_forward
+-
+-
+-def fix_checkpoint():
+-    """checkpoints are now added and removed in embedding/hypernet code, since torch doesn't want
+-    checkpoints to be added when not training (there's a warning)"""
+-
+-    pass
+-
+-
+-def weighted_loss(sd_model, pred, target, mean=True):
+-    #Calculate the weight normally, but ignore the mean
+-    loss = sd_model._old_get_loss(pred, target, mean=False)
+-
+-    #Check if we have weights available
+-    weight = getattr(sd_model, '_custom_loss_weight', None)
+-    if weight is not None:
+-        loss *= weight
+-
+-    #Return the loss, as mean if specified
+-    return loss.mean() if mean else loss
+-
+-def weighted_forward(sd_model, x, c, w, *args, **kwargs):
+-    try:
+-        #Temporarily append weights to a place accessible during loss calc
+-        sd_model._custom_loss_weight = w
+-
+-        #Replace 'get_loss' with a weight-aware one. Otherwise we need to reimplement 'forward' completely
+-        #Keep 'get_loss', but don't overwrite the previous old_get_loss if it's already set
+-        if not hasattr(sd_model, '_old_get_loss'):
+-            sd_model._old_get_loss = sd_model.get_loss
+-        sd_model.get_loss = MethodType(weighted_loss, sd_model)
+-
+-        #Run the standard forward function, but with the patched 'get_loss'
+-        return sd_model.forward(x, c, *args, **kwargs)
+-    finally:
+-        try:
+-            #Delete temporary weights if appended
+-            del sd_model._custom_loss_weight
+-        except AttributeError:
+-            pass
+-
+-        #If we have an old loss function, reset the loss function to the original one
+-        if hasattr(sd_model, '_old_get_loss'):
+-            sd_model.get_loss = sd_model._old_get_loss
+-            del sd_model._old_get_loss
+-
+-def apply_weighted_forward(sd_model):
+-    #Add new function 'weighted_forward' that can be called to calc weighted loss
+-    sd_model.weighted_forward = MethodType(weighted_forward, sd_model)
+-
+-def undo_weighted_forward(sd_model):
+-    try:
+-        del sd_model.weighted_forward
+-    except AttributeError:
+-        pass
+-
+-
+-class StableDiffusionModelHijack:
+-    fixes = None
+-    layers = None
+-    circular_enabled = False
+-    clip = None
+-    optimization_method = None
+-
+-    def __init__(self):
+-        import modules.textual_inversion.textual_inversion
+-
+-        self.extra_generation_params = {}
+-        self.comments = []
+-
+-        self.embedding_db = modules.textual_inversion.textual_inversion.EmbeddingDatabase()
+-        self.embedding_db.add_embedding_dir(cmd_opts.embeddings_dir)
+-
+-    def apply_optimizations(self, option=None):
+-        try:
+-            self.optimization_method = apply_optimizations(option)
+-        except Exception as e:
+-            errors.display(e, "applying cross attention optimization")
+-            undo_optimizations()
+-
+-    def convert_sdxl_to_ssd(self, m):
+-        """Converts an SDXL model to a Segmind Stable Diffusion model (see https://huggingface.co/segmind/SSD-1B)"""
+-
+-        delattr(m.model.diffusion_model.middle_block, '1')
+-        delattr(m.model.diffusion_model.middle_block, '2')
+-        for i in ['9', '8', '7', '6', '5', '4']:
+-            delattr(m.model.diffusion_model.input_blocks[7][1].transformer_blocks, i)
+-            delattr(m.model.diffusion_model.input_blocks[8][1].transformer_blocks, i)
+-            delattr(m.model.diffusion_model.output_blocks[0][1].transformer_blocks, i)
+-            delattr(m.model.diffusion_model.output_blocks[1][1].transformer_blocks, i)
+-        delattr(m.model.diffusion_model.output_blocks[4][1].transformer_blocks, '1')
+-        delattr(m.model.diffusion_model.output_blocks[5][1].transformer_blocks, '1')
+-        devices.torch_gc()
+-
+-    def hijack(self, m):
+-        conditioner = getattr(m, 'conditioner', None)
+-        if conditioner:
+-            text_cond_models = []
+-
+-            for i in range(len(conditioner.embedders)):
+-                embedder = conditioner.embedders[i]
+-                typename = type(embedder).__name__
+-                if typename == 'FrozenOpenCLIPEmbedder':
+-                    embedder.model.token_embedding = EmbeddingsWithFixes(embedder.model.token_embedding, self)
+-                    conditioner.embedders[i] = sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords(embedder, self)
+-                    text_cond_models.append(conditioner.embedders[i])
+-                if typename == 'FrozenCLIPEmbedder':
+-                    model_embeddings = embedder.transformer.text_model.embeddings
+-                    model_embeddings.token_embedding = EmbeddingsWithFixes(model_embeddings.token_embedding, self)
+-                    conditioner.embedders[i] = sd_hijack_clip.FrozenCLIPEmbedderForSDXLWithCustomWords(embedder, self)
+-                    text_cond_models.append(conditioner.embedders[i])
+-                if typename == 'FrozenOpenCLIPEmbedder2':
+-                    embedder.model.token_embedding = EmbeddingsWithFixes(embedder.model.token_embedding, self, textual_inversion_key='clip_g')
+-                    conditioner.embedders[i] = sd_hijack_open_clip.FrozenOpenCLIPEmbedder2WithCustomWords(embedder, self)
+-                    text_cond_models.append(conditioner.embedders[i])
+-
+-            if len(text_cond_models) == 1:
+-                m.cond_stage_model = text_cond_models[0]
+-            else:
+-                m.cond_stage_model = conditioner
+-
+-        if type(m.cond_stage_model) == xlmr.BertSeriesModelWithTransformation or type(m.cond_stage_model) == xlmr_m18.BertSeriesModelWithTransformation:
+-            model_embeddings = m.cond_stage_model.roberta.embeddings
+-            model_embeddings.token_embedding = EmbeddingsWithFixes(model_embeddings.word_embeddings, self)
+-            m.cond_stage_model = sd_hijack_xlmr.FrozenXLMREmbedderWithCustomWords(m.cond_stage_model, self)
+-
+-        elif type(m.cond_stage_model) == ldm.modules.encoders.modules.FrozenCLIPEmbedder:
+-            model_embeddings = m.cond_stage_model.transformer.text_model.embeddings
+-            model_embeddings.token_embedding = EmbeddingsWithFixes(model_embeddings.token_embedding, self)
+-            m.cond_stage_model = sd_hijack_clip.FrozenCLIPEmbedderWithCustomWords(m.cond_stage_model, self)
+-
+-        elif type(m.cond_stage_model) == ldm.modules.encoders.modules.FrozenOpenCLIPEmbedder:
+-            m.cond_stage_model.model.token_embedding = EmbeddingsWithFixes(m.cond_stage_model.model.token_embedding, self)
+-            m.cond_stage_model = sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords(m.cond_stage_model, self)
+-
+-        apply_weighted_forward(m)
+-        if m.cond_stage_key == "edit":
+-            sd_hijack_unet.hijack_ddpm_edit()
+-
+-        self.apply_optimizations()
+-
+-        self.clip = m.cond_stage_model
+-
+-        def flatten(el):
+-            flattened = [flatten(children) for children in el.children()]
+-            res = [el]
+-            for c in flattened:
+-                res += c
+-            return res
+-
+-        self.layers = flatten(m)
+-
+-        import modules.models.diffusion.ddpm_edit
+-
+-        if isinstance(m, ldm.models.diffusion.ddpm.LatentDiffusion):
+-            sd_unet.original_forward = ldm_original_forward
+-        elif isinstance(m, modules.models.diffusion.ddpm_edit.LatentDiffusion):
+-            sd_unet.original_forward = ldm_original_forward
+-        elif isinstance(m, sgm.models.diffusion.DiffusionEngine):
+-            sd_unet.original_forward = sgm_original_forward
+-        else:
+-            sd_unet.original_forward = None
+-
+-
+-    def undo_hijack(self, m):
+-        conditioner = getattr(m, 'conditioner', None)
+-        if conditioner:
+-            for i in range(len(conditioner.embedders)):
+-                embedder = conditioner.embedders[i]
+-                if isinstance(embedder, (sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords, sd_hijack_open_clip.FrozenOpenCLIPEmbedder2WithCustomWords)):
+-                    embedder.wrapped.model.token_embedding = embedder.wrapped.model.token_embedding.wrapped
+-                    conditioner.embedders[i] = embedder.wrapped
+-                if isinstance(embedder, sd_hijack_clip.FrozenCLIPEmbedderForSDXLWithCustomWords):
+-                    embedder.wrapped.transformer.text_model.embeddings.token_embedding = embedder.wrapped.transformer.text_model.embeddings.token_embedding.wrapped
+-                    conditioner.embedders[i] = embedder.wrapped
+-
+-            if hasattr(m, 'cond_stage_model'):
+-                delattr(m, 'cond_stage_model')
+-
+-        elif type(m.cond_stage_model) == sd_hijack_xlmr.FrozenXLMREmbedderWithCustomWords:
+-            m.cond_stage_model = m.cond_stage_model.wrapped
+-
+-        elif type(m.cond_stage_model) == sd_hijack_clip.FrozenCLIPEmbedderWithCustomWords:
+-            m.cond_stage_model = m.cond_stage_model.wrapped
+-
+-            model_embeddings = m.cond_stage_model.transformer.text_model.embeddings
+-            if type(model_embeddings.token_embedding) == EmbeddingsWithFixes:
+-                model_embeddings.token_embedding = model_embeddings.token_embedding.wrapped
+-        elif type(m.cond_stage_model) == sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords:
+-            m.cond_stage_model.wrapped.model.token_embedding = m.cond_stage_model.wrapped.model.token_embedding.wrapped
+-            m.cond_stage_model = m.cond_stage_model.wrapped
+-
+-        undo_optimizations()
+-        undo_weighted_forward(m)
+-
+-        self.apply_circular(False)
+-        self.layers = None
+-        self.clip = None
+-
+-
+-    def apply_circular(self, enable):
+-        if self.circular_enabled == enable:
+-            return
+-
+-        self.circular_enabled = enable
+-
+-        for layer in [layer for layer in self.layers if type(layer) == torch.nn.Conv2d]:
+-            layer.padding_mode = 'circular' if enable else 'zeros'
+-
+-    def clear_comments(self):
+-        self.comments = []
+-        self.extra_generation_params = {}
+-
+-    def get_prompt_lengths(self, text):
+-        if self.clip is None:
+-            return "-", "-"
+-
+-        if hasattr(self.clip, 'get_token_count'):
+-            token_count = self.clip.get_token_count(text)
+-        else:
+-            _, token_count = self.clip.process_texts([text])
+-
+-        return token_count, self.clip.get_target_prompt_token_count(token_count)
+-
+-    def redo_hijack(self, m):
+-        self.undo_hijack(m)
+-        self.hijack(m)
+-
+-
+-class EmbeddingsWithFixes(torch.nn.Module):
+-    def __init__(self, wrapped, embeddings, textual_inversion_key='clip_l'):
+-        super().__init__()
+-        self.wrapped = wrapped
+-        self.embeddings = embeddings
+-        self.textual_inversion_key = textual_inversion_key
+-
+-    def forward(self, input_ids):
+-        batch_fixes = self.embeddings.fixes
+-        self.embeddings.fixes = None
+-
+-        inputs_embeds = self.wrapped(input_ids)
+-
+-        if batch_fixes is None or len(batch_fixes) == 0 or max([len(x) for x in batch_fixes]) == 0:
+-            return inputs_embeds
+-
+-        vecs = []
+-        for fixes, tensor in zip(batch_fixes, inputs_embeds):
+-            for offset, embedding in fixes:
+-                vec = embedding.vec[self.textual_inversion_key] if isinstance(embedding.vec, dict) else embedding.vec
+-                emb = devices.cond_cast_unet(vec)
+-                emb_len = min(tensor.shape[0] - offset - 1, emb.shape[0])
+-                tensor = torch.cat([tensor[0:offset + 1], emb[0:emb_len], tensor[offset + 1 + emb_len:]]).to(dtype=inputs_embeds.dtype)
+-
+-            vecs.append(tensor)
+-
+-        return torch.stack(vecs)
+-
+-
+-class TextualInversionEmbeddings(torch.nn.Embedding):
+-    def __init__(self, num_embeddings: int, embedding_dim: int, textual_inversion_key='clip_l', **kwargs):
+-        super().__init__(num_embeddings, embedding_dim, **kwargs)
+-
+-        self.embeddings = model_hijack
+-        self.textual_inversion_key = textual_inversion_key
+-
+-    @property
+-    def wrapped(self):
+-        return super().forward
+-
+-    def forward(self, input_ids):
+-        return EmbeddingsWithFixes.forward(self, input_ids)
+-
+-
+-def add_circular_option_to_conv_2d():
+-    conv2d_constructor = torch.nn.Conv2d.__init__
+-
+-    def conv2d_constructor_circular(self, *args, **kwargs):
+-        return conv2d_constructor(self, *args, padding_mode='circular', **kwargs)
+-
+-    torch.nn.Conv2d.__init__ = conv2d_constructor_circular
+-
+-
+-model_hijack = StableDiffusionModelHijack()
+-
+-
+-def register_buffer(self, name, attr):
+-    """
+-    Fix register buffer bug for Mac OS.
+-    """
+-
+-    if type(attr) == torch.Tensor:
+-        if attr.device != devices.device:
+-            attr = attr.to(device=devices.device, dtype=(torch.float32 if devices.device.type == 'mps' else None))
+-
+-    setattr(self, name, attr)
+-
+-
+-ldm.models.diffusion.ddim.DDIMSampler.register_buffer = register_buffer
+-ldm.models.diffusion.plms.PLMSSampler.register_buffer = register_buffer
++import torch
++from torch.nn.functional import silu
++from types import MethodType
++
++from modules import devices, sd_hijack_optimizations, shared, script_callbacks, errors, sd_unet, patches, sd_opt
++from modules.hypernetworks import hypernetwork
++from modules.shared import cmd_opts
++from modules import sd_hijack_clip, sd_hijack_open_clip, sd_hijack_unet, sd_hijack_xlmr, xlmr, xlmr_m18
++
++import ldm.modules.attention
++import ldm.modules.diffusionmodules.model
++import ldm.modules.diffusionmodules.openaimodel
++import ldm.models.diffusion.ddpm
++import ldm.models.diffusion.ddim
++import ldm.models.diffusion.plms
++import ldm.modules.encoders.modules
++
++import sgm.modules.attention
++import sgm.modules.diffusionmodules.model
++import sgm.modules.diffusionmodules.openaimodel
++import sgm.modules.encoders.modules
++
++attention_CrossAttention_forward = ldm.modules.attention.CrossAttention.forward
++diffusionmodules_model_nonlinearity = ldm.modules.diffusionmodules.model.nonlinearity
++diffusionmodules_model_AttnBlock_forward = ldm.modules.diffusionmodules.model.AttnBlock.forward
++
++# new memory efficient cross attention blocks do not support hypernets and we already
++# have memory efficient cross attention anyway, so this disables SD2.0's memory efficient cross attention
++ldm.modules.attention.MemoryEfficientCrossAttention = ldm.modules.attention.CrossAttention
++ldm.modules.attention.BasicTransformerBlock.ATTENTION_MODES["softmax-xformers"] = ldm.modules.attention.CrossAttention
++
++# silence new console spam from SD2
++ldm.modules.attention.print = shared.ldm_print
++ldm.modules.diffusionmodules.model.print = shared.ldm_print
++ldm.util.print = shared.ldm_print
++ldm.models.diffusion.ddpm.print = shared.ldm_print
++
++optimizers = []
++current_optimizer: sd_hijack_optimizations.SdOptimization = None
++
++ldm_patched_forward = sd_unet.create_unet_forward(ldm.modules.diffusionmodules.openaimodel.UNetModel.forward)
++ldm_original_forward = patches.patch(__file__, ldm.modules.diffusionmodules.openaimodel.UNetModel, "forward", ldm_patched_forward)
++
++sgm_patched_forward = sd_unet.create_unet_forward(sgm.modules.diffusionmodules.openaimodel.UNetModel.forward)
++sgm_original_forward = patches.patch(__file__, sgm.modules.diffusionmodules.openaimodel.UNetModel, "forward", sgm_patched_forward)
++
++
++def list_optimizers():
++    new_optimizers = script_callbacks.list_optimizers_callback()
++
++    new_optimizers = [x for x in new_optimizers if x.is_available()]
++
++    new_optimizers = sorted(new_optimizers, key=lambda x: x.priority, reverse=True)
++
++    optimizers.clear()
++    optimizers.extend(new_optimizers)
++
++
++def apply_optimizations(option=None):
++    global current_optimizer
++
++    undo_optimizations()
++
++    if len(optimizers) == 0:
++        # a script can access the model very early, and optimizations would not be filled by then
++        current_optimizer = None
++        return ''
++
++    ldm.modules.diffusionmodules.model.nonlinearity = silu
++    ldm.modules.diffusionmodules.openaimodel.th = sd_hijack_unet.th
++
++    sgm.modules.diffusionmodules.model.nonlinearity = silu
++    sgm.modules.diffusionmodules.openaimodel.th = sd_hijack_unet.th
++
++    if current_optimizer is not None:
++        current_optimizer.undo()
++        current_optimizer = None
++
++    selection = option or shared.opts.cross_attention_optimization
++    if selection == "Automatic" and len(optimizers) > 0:
++        matching_optimizer = next(iter([x for x in optimizers if x.cmd_opt and getattr(shared.cmd_opts, x.cmd_opt, False)]), optimizers[0])
++    else:
++        matching_optimizer = next(iter([x for x in optimizers if x.title() == selection]), None)
++
++    if selection == "None":
++        matching_optimizer = None
++    elif selection == "Automatic" and shared.cmd_opts.disable_opt_split_attention:
++        matching_optimizer = None
++    elif matching_optimizer is None:
++        matching_optimizer = optimizers[0]
++
++    if matching_optimizer is not None:
++        print(f"Applying attention optimization: {matching_optimizer.name}... ", end='')
++        matching_optimizer.apply()
++        print("done.")
++        current_optimizer = matching_optimizer
++        return current_optimizer.name
++    else:
++        print("Disabling attention optimization")
++        return ''
++
++
++def undo_optimizations():
++    ldm.modules.diffusionmodules.model.nonlinearity = diffusionmodules_model_nonlinearity
++    ldm.modules.attention.CrossAttention.forward = hypernetwork.attention_CrossAttention_forward
++    ldm.modules.diffusionmodules.model.AttnBlock.forward = diffusionmodules_model_AttnBlock_forward
++
++    sgm.modules.diffusionmodules.model.nonlinearity = diffusionmodules_model_nonlinearity
++    sgm.modules.attention.CrossAttention.forward = hypernetwork.attention_CrossAttention_forward
++    sgm.modules.diffusionmodules.model.AttnBlock.forward = diffusionmodules_model_AttnBlock_forward
++
++
++def fix_checkpoint():
++    """checkpoints are now added and removed in embedding/hypernet code, since torch doesn't want
++    checkpoints to be added when not training (there's a warning)"""
++
++    pass
++
++
++def weighted_loss(sd_model, pred, target, mean=True):
++    #Calculate the weight normally, but ignore the mean
++    loss = sd_model._old_get_loss(pred, target, mean=False)
++
++    #Check if we have weights available
++    weight = getattr(sd_model, '_custom_loss_weight', None)
++    if weight is not None:
++        loss *= weight
++
++    #Return the loss, as mean if specified
++    return loss.mean() if mean else loss
++
++def weighted_forward(sd_model, x, c, w, *args, **kwargs):
++    try:
++        #Temporarily append weights to a place accessible during loss calc
++        sd_model._custom_loss_weight = w
++
++        #Replace 'get_loss' with a weight-aware one. Otherwise we need to reimplement 'forward' completely
++        #Keep 'get_loss', but don't overwrite the previous old_get_loss if it's already set
++        if not hasattr(sd_model, '_old_get_loss'):
++            sd_model._old_get_loss = sd_model.get_loss
++        sd_model.get_loss = MethodType(weighted_loss, sd_model)
++
++        #Run the standard forward function, but with the patched 'get_loss'
++        return sd_model.forward(x, c, *args, **kwargs)
++    finally:
++        try:
++            #Delete temporary weights if appended
++            del sd_model._custom_loss_weight
++        except AttributeError:
++            pass
++
++        #If we have an old loss function, reset the loss function to the original one
++        if hasattr(sd_model, '_old_get_loss'):
++            sd_model.get_loss = sd_model._old_get_loss
++            del sd_model._old_get_loss
++
++def apply_weighted_forward(sd_model):
++    #Add new function 'weighted_forward' that can be called to calc weighted loss
++    sd_model.weighted_forward = MethodType(weighted_forward, sd_model)
++
++def undo_weighted_forward(sd_model):
++    try:
++        del sd_model.weighted_forward
++    except AttributeError:
++        pass
++
++
++class StableDiffusionModelHijack:
++    fixes = None
++    layers = None
++    circular_enabled = False
++    clip = None
++    optimization_method = None
++
++    def __init__(self):
++        import modules.textual_inversion.textual_inversion
++
++        self.extra_generation_params = {}
++        self.comments = []
++
++        self.embedding_db = modules.textual_inversion.textual_inversion.EmbeddingDatabase()
++        self.embedding_db.add_embedding_dir(cmd_opts.embeddings_dir)
++
++    def apply_optimizations(self, option=None):
++        try:
++            self.optimization_method = apply_optimizations(option)
++        except Exception as e:
++            errors.display(e, "applying cross attention optimization")
++            undo_optimizations()
++
++    def convert_sdxl_to_ssd(self, m):
++        """Converts an SDXL model to a Segmind Stable Diffusion model (see https://huggingface.co/segmind/SSD-1B)"""
++
++        delattr(m.model.diffusion_model.middle_block, '1')
++        delattr(m.model.diffusion_model.middle_block, '2')
++        for i in ['9', '8', '7', '6', '5', '4']:
++            delattr(m.model.diffusion_model.input_blocks[7][1].transformer_blocks, i)
++            delattr(m.model.diffusion_model.input_blocks[8][1].transformer_blocks, i)
++            delattr(m.model.diffusion_model.output_blocks[0][1].transformer_blocks, i)
++            delattr(m.model.diffusion_model.output_blocks[1][1].transformer_blocks, i)
++        delattr(m.model.diffusion_model.output_blocks[4][1].transformer_blocks, '1')
++        delattr(m.model.diffusion_model.output_blocks[5][1].transformer_blocks, '1')
++        devices.torch_gc()
++
++    def hijack(self, m):
++        conditioner = getattr(m, 'conditioner', None)
++        if conditioner:
++            text_cond_models = []
++
++            for i in range(len(conditioner.embedders)):
++                embedder = conditioner.embedders[i]
++                typename = type(embedder).__name__
++                if typename == 'FrozenOpenCLIPEmbedder':
++                    embedder.model.token_embedding = EmbeddingsWithFixes(embedder.model.token_embedding, self)
++                    conditioner.embedders[i] = sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords(embedder, self)
++                    text_cond_models.append(conditioner.embedders[i])
++                if typename == 'FrozenCLIPEmbedder':
++                    model_embeddings = embedder.transformer.text_model.embeddings
++                    model_embeddings.token_embedding = EmbeddingsWithFixes(model_embeddings.token_embedding, self)
++                    conditioner.embedders[i] = sd_hijack_clip.FrozenCLIPEmbedderForSDXLWithCustomWords(embedder, self)
++                    text_cond_models.append(conditioner.embedders[i])
++                if typename == 'FrozenOpenCLIPEmbedder2':
++                    embedder.model.token_embedding = EmbeddingsWithFixes(embedder.model.token_embedding, self, textual_inversion_key='clip_g')
++                    conditioner.embedders[i] = sd_hijack_open_clip.FrozenOpenCLIPEmbedder2WithCustomWords(embedder, self)
++                    text_cond_models.append(conditioner.embedders[i])
++
++            if len(text_cond_models) == 1:
++                m.cond_stage_model = text_cond_models[0]
++            else:
++                m.cond_stage_model = conditioner
++
++        if type(m.cond_stage_model) == xlmr.BertSeriesModelWithTransformation or type(m.cond_stage_model) == xlmr_m18.BertSeriesModelWithTransformation:
++            model_embeddings = m.cond_stage_model.roberta.embeddings
++            model_embeddings.token_embedding = EmbeddingsWithFixes(model_embeddings.word_embeddings, self)
++            m.cond_stage_model = sd_hijack_xlmr.FrozenXLMREmbedderWithCustomWords(m.cond_stage_model, self)
++
++        elif type(m.cond_stage_model) == ldm.modules.encoders.modules.FrozenCLIPEmbedder:
++            model_embeddings = m.cond_stage_model.transformer.text_model.embeddings
++            model_embeddings.token_embedding = EmbeddingsWithFixes(model_embeddings.token_embedding, self)
++            m.cond_stage_model = sd_hijack_clip.FrozenCLIPEmbedderWithCustomWords(m.cond_stage_model, self)
++
++        elif type(m.cond_stage_model) == ldm.modules.encoders.modules.FrozenOpenCLIPEmbedder:
++            m.cond_stage_model.model.token_embedding = EmbeddingsWithFixes(m.cond_stage_model.model.token_embedding, self)
++            m.cond_stage_model = sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords(m.cond_stage_model, self)
++
++        apply_weighted_forward(m)
++        if m.cond_stage_key == "edit":
++            sd_hijack_unet.hijack_ddpm_edit()
++
++        self.apply_optimizations()
++
++        self.clip = m.cond_stage_model
++
++        def flatten(el):
++            flattened = [flatten(children) for children in el.children()]
++            res = [el]
++            for c in flattened:
++                res += c
++            return res
++
++        self.layers = flatten(m)
++
++        import modules.models.diffusion.ddpm_edit
++
++        if isinstance(m, ldm.models.diffusion.ddpm.LatentDiffusion):
++            sd_unet.original_forward = ldm_original_forward
++        elif isinstance(m, modules.models.diffusion.ddpm_edit.LatentDiffusion):
++            sd_unet.original_forward = ldm_original_forward
++        elif isinstance(m, sgm.models.diffusion.DiffusionEngine):
++            sd_unet.original_forward = sgm_original_forward
++        else:
++            sd_unet.original_forward = None
++
++        sd_opt.apply(m)
++
++    def undo_hijack(self, m):
++        sd_opt.undo(m)
++        conditioner = getattr(m, 'conditioner', None)
++        if conditioner:
++            for i in range(len(conditioner.embedders)):
++                embedder = conditioner.embedders[i]
++                if isinstance(embedder, (sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords, sd_hijack_open_clip.FrozenOpenCLIPEmbedder2WithCustomWords)):
++                    embedder.wrapped.model.token_embedding = embedder.wrapped.model.token_embedding.wrapped
++                    conditioner.embedders[i] = embedder.wrapped
++                if isinstance(embedder, sd_hijack_clip.FrozenCLIPEmbedderForSDXLWithCustomWords):
++                    embedder.wrapped.transformer.text_model.embeddings.token_embedding = embedder.wrapped.transformer.text_model.embeddings.token_embedding.wrapped
++                    conditioner.embedders[i] = embedder.wrapped
++
++            if hasattr(m, 'cond_stage_model'):
++                delattr(m, 'cond_stage_model')
++
++        elif type(m.cond_stage_model) == sd_hijack_xlmr.FrozenXLMREmbedderWithCustomWords:
++            m.cond_stage_model = m.cond_stage_model.wrapped
++
++        elif type(m.cond_stage_model) == sd_hijack_clip.FrozenCLIPEmbedderWithCustomWords:
++            m.cond_stage_model = m.cond_stage_model.wrapped
++
++            model_embeddings = m.cond_stage_model.transformer.text_model.embeddings
++            if type(model_embeddings.token_embedding) == EmbeddingsWithFixes:
++                model_embeddings.token_embedding = model_embeddings.token_embedding.wrapped
++        elif type(m.cond_stage_model) == sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords:
++            m.cond_stage_model.wrapped.model.token_embedding = m.cond_stage_model.wrapped.model.token_embedding.wrapped
++            m.cond_stage_model = m.cond_stage_model.wrapped
++
++        undo_optimizations()
++        undo_weighted_forward(m)
++
++        self.apply_circular(False)
++        self.layers = None
++        self.clip = None
++
++
++    def apply_circular(self, enable):
++        if self.circular_enabled == enable:
++            return
++
++        self.circular_enabled = enable
++
++        for layer in [layer for layer in self.layers if type(layer) == torch.nn.Conv2d]:
++            layer.padding_mode = 'circular' if enable else 'zeros'
++
++    def clear_comments(self):
++        self.comments = []
++        self.extra_generation_params = {}
++
++    def get_prompt_lengths(self, text):
++        if self.clip is None:
++            return "-", "-"
++
++        if hasattr(self.clip, 'get_token_count'):
++            token_count = self.clip.get_token_count(text)
++        else:
++            _, token_count = self.clip.process_texts([text])
++
++        return token_count, self.clip.get_target_prompt_token_count(token_count)
++
++    def redo_hijack(self, m):
++        self.undo_hijack(m)
++        self.hijack(m)
++
++
++class EmbeddingsWithFixes(torch.nn.Module):
++    def __init__(self, wrapped, embeddings, textual_inversion_key='clip_l'):
++        super().__init__()
++        self.wrapped = wrapped
++        self.embeddings = embeddings
++        self.textual_inversion_key = textual_inversion_key
++
++    def forward(self, input_ids):
++        batch_fixes = self.embeddings.fixes
++        self.embeddings.fixes = None
++
++        inputs_embeds = self.wrapped(input_ids)
++
++        if batch_fixes is None or len(batch_fixes) == 0 or max([len(x) for x in batch_fixes]) == 0:
++            return inputs_embeds
++
++        vecs = []
++        for fixes, tensor in zip(batch_fixes, inputs_embeds):
++            for offset, embedding in fixes:
++                vec = embedding.vec[self.textual_inversion_key] if isinstance(embedding.vec, dict) else embedding.vec
++                emb = devices.cond_cast_unet(vec)
++                emb_len = min(tensor.shape[0] - offset - 1, emb.shape[0])
++                tensor = torch.cat([tensor[0:offset + 1], emb[0:emb_len], tensor[offset + 1 + emb_len:]]).to(dtype=inputs_embeds.dtype)
++
++            vecs.append(tensor)
++
++        return torch.stack(vecs)
++
++
++class TextualInversionEmbeddings(torch.nn.Embedding):
++    def __init__(self, num_embeddings: int, embedding_dim: int, textual_inversion_key='clip_l', **kwargs):
++        super().__init__(num_embeddings, embedding_dim, **kwargs)
++
++        self.embeddings = model_hijack
++        self.textual_inversion_key = textual_inversion_key
++
++    @property
++    def wrapped(self):
++        return super().forward
++
++    def forward(self, input_ids):
++        return EmbeddingsWithFixes.forward(self, input_ids)
++
++
++def add_circular_option_to_conv_2d():
++    conv2d_constructor = torch.nn.Conv2d.__init__
++
++    def conv2d_constructor_circular(self, *args, **kwargs):
++        return conv2d_constructor(self, *args, padding_mode='circular', **kwargs)
++
++    torch.nn.Conv2d.__init__ = conv2d_constructor_circular
++
++
++model_hijack = StableDiffusionModelHijack()
++
++
++def register_buffer(self, name, attr):
++    """
++    Fix register buffer bug for Mac OS.
++    """
++
++    if type(attr) == torch.Tensor:
++        if attr.device != devices.device:
++            attr = attr.to(device=devices.device, dtype=(torch.float32 if devices.device.type == 'mps' else None))
++
++    setattr(self, name, attr)
++
++
++ldm.models.diffusion.ddim.DDIMSampler.register_buffer = register_buffer
++ldm.models.diffusion.plms.PLMSSampler.register_buffer = register_buffer
+diff --git a/modules/sd_hijack_optimizations.py b/modules/sd_hijack_optimizations.py
+index 0269f1f..39a0c3f 100644
+--- a/modules/sd_hijack_optimizations.py
++++ b/modules/sd_hijack_optimizations.py
+@@ -1,677 +1,680 @@
+-from __future__ import annotations
+-import math
+-import psutil
+-import platform
+-
+-import torch
+-from torch import einsum
+-
+-from ldm.util import default
+-from einops import rearrange
+-
+-from modules import shared, errors, devices, sub_quadratic_attention
+-from modules.hypernetworks import hypernetwork
+-
+-import ldm.modules.attention
+-import ldm.modules.diffusionmodules.model
+-
+-import sgm.modules.attention
+-import sgm.modules.diffusionmodules.model
+-
+-diffusionmodules_model_AttnBlock_forward = ldm.modules.diffusionmodules.model.AttnBlock.forward
+-sgm_diffusionmodules_model_AttnBlock_forward = sgm.modules.diffusionmodules.model.AttnBlock.forward
+-
+-
+-class SdOptimization:
+-    name: str = None
+-    label: str | None = None
+-    cmd_opt: str | None = None
+-    priority: int = 0
+-
+-    def title(self):
+-        if self.label is None:
+-            return self.name
+-
+-        return f"{self.name} - {self.label}"
+-
+-    def is_available(self):
+-        return True
+-
+-    def apply(self):
+-        pass
+-
+-    def undo(self):
+-        ldm.modules.attention.CrossAttention.forward = hypernetwork.attention_CrossAttention_forward
+-        ldm.modules.diffusionmodules.model.AttnBlock.forward = diffusionmodules_model_AttnBlock_forward
+-
+-        sgm.modules.attention.CrossAttention.forward = hypernetwork.attention_CrossAttention_forward
+-        sgm.modules.diffusionmodules.model.AttnBlock.forward = sgm_diffusionmodules_model_AttnBlock_forward
+-
+-
+-class SdOptimizationXformers(SdOptimization):
+-    name = "xformers"
+-    cmd_opt = "xformers"
+-    priority = 100
+-
+-    def is_available(self):
+-        return shared.cmd_opts.force_enable_xformers or (shared.xformers_available and torch.cuda.is_available() and (6, 0) <= torch.cuda.get_device_capability(shared.device) <= (9, 0))
+-
+-    def apply(self):
+-        ldm.modules.attention.CrossAttention.forward = xformers_attention_forward
+-        ldm.modules.diffusionmodules.model.AttnBlock.forward = xformers_attnblock_forward
+-        sgm.modules.attention.CrossAttention.forward = xformers_attention_forward
+-        sgm.modules.diffusionmodules.model.AttnBlock.forward = xformers_attnblock_forward
+-
+-
+-class SdOptimizationSdpNoMem(SdOptimization):
+-    name = "sdp-no-mem"
+-    label = "scaled dot product without memory efficient attention"
+-    cmd_opt = "opt_sdp_no_mem_attention"
+-    priority = 80
+-
+-    def is_available(self):
+-        return hasattr(torch.nn.functional, "scaled_dot_product_attention") and callable(torch.nn.functional.scaled_dot_product_attention)
+-
+-    def apply(self):
+-        ldm.modules.attention.CrossAttention.forward = scaled_dot_product_no_mem_attention_forward
+-        ldm.modules.diffusionmodules.model.AttnBlock.forward = sdp_no_mem_attnblock_forward
+-        sgm.modules.attention.CrossAttention.forward = scaled_dot_product_no_mem_attention_forward
+-        sgm.modules.diffusionmodules.model.AttnBlock.forward = sdp_no_mem_attnblock_forward
+-
+-
+-class SdOptimizationSdp(SdOptimizationSdpNoMem):
+-    name = "sdp"
+-    label = "scaled dot product"
+-    cmd_opt = "opt_sdp_attention"
+-    priority = 70
+-
+-    def apply(self):
+-        ldm.modules.attention.CrossAttention.forward = scaled_dot_product_attention_forward
+-        ldm.modules.diffusionmodules.model.AttnBlock.forward = sdp_attnblock_forward
+-        sgm.modules.attention.CrossAttention.forward = scaled_dot_product_attention_forward
+-        sgm.modules.diffusionmodules.model.AttnBlock.forward = sdp_attnblock_forward
+-
+-
+-class SdOptimizationSubQuad(SdOptimization):
+-    name = "sub-quadratic"
+-    cmd_opt = "opt_sub_quad_attention"
+-
+-    @property
+-    def priority(self):
+-        return 1000 if shared.device.type == 'mps' else 10
+-
+-    def apply(self):
+-        ldm.modules.attention.CrossAttention.forward = sub_quad_attention_forward
+-        ldm.modules.diffusionmodules.model.AttnBlock.forward = sub_quad_attnblock_forward
+-        sgm.modules.attention.CrossAttention.forward = sub_quad_attention_forward
+-        sgm.modules.diffusionmodules.model.AttnBlock.forward = sub_quad_attnblock_forward
+-
+-
+-class SdOptimizationV1(SdOptimization):
+-    name = "V1"
+-    label = "original v1"
+-    cmd_opt = "opt_split_attention_v1"
+-    priority = 10
+-
+-    def apply(self):
+-        ldm.modules.attention.CrossAttention.forward = split_cross_attention_forward_v1
+-        sgm.modules.attention.CrossAttention.forward = split_cross_attention_forward_v1
+-
+-
+-class SdOptimizationInvokeAI(SdOptimization):
+-    name = "InvokeAI"
+-    cmd_opt = "opt_split_attention_invokeai"
+-
+-    @property
+-    def priority(self):
+-        return 1000 if shared.device.type != 'mps' and not torch.cuda.is_available() else 10
+-
+-    def apply(self):
+-        ldm.modules.attention.CrossAttention.forward = split_cross_attention_forward_invokeAI
+-        sgm.modules.attention.CrossAttention.forward = split_cross_attention_forward_invokeAI
+-
+-
+-class SdOptimizationDoggettx(SdOptimization):
+-    name = "Doggettx"
+-    cmd_opt = "opt_split_attention"
+-    priority = 90
+-
+-    def apply(self):
+-        ldm.modules.attention.CrossAttention.forward = split_cross_attention_forward
+-        ldm.modules.diffusionmodules.model.AttnBlock.forward = cross_attention_attnblock_forward
+-        sgm.modules.attention.CrossAttention.forward = split_cross_attention_forward
+-        sgm.modules.diffusionmodules.model.AttnBlock.forward = cross_attention_attnblock_forward
+-
+-
+-def list_optimizers(res):
+-    res.extend([
+-        SdOptimizationXformers(),
+-        SdOptimizationSdpNoMem(),
+-        SdOptimizationSdp(),
+-        SdOptimizationSubQuad(),
+-        SdOptimizationV1(),
+-        SdOptimizationInvokeAI(),
+-        SdOptimizationDoggettx(),
+-    ])
+-
+-
+-if shared.cmd_opts.xformers or shared.cmd_opts.force_enable_xformers:
+-    try:
+-        import xformers.ops
+-        shared.xformers_available = True
+-    except Exception:
+-        errors.report("Cannot import xformers", exc_info=True)
+-
+-
+-def get_available_vram():
+-    if shared.device.type == 'cuda':
+-        stats = torch.cuda.memory_stats(shared.device)
+-        mem_active = stats['active_bytes.all.current']
+-        mem_reserved = stats['reserved_bytes.all.current']
+-        mem_free_cuda, _ = torch.cuda.mem_get_info(torch.cuda.current_device())
+-        mem_free_torch = mem_reserved - mem_active
+-        mem_free_total = mem_free_cuda + mem_free_torch
+-        return mem_free_total
+-    else:
+-        return psutil.virtual_memory().available
+-
+-
+-# see https://github.com/basujindal/stable-diffusion/pull/117 for discussion
+-def split_cross_attention_forward_v1(self, x, context=None, mask=None, **kwargs):
+-    h = self.heads
+-
+-    q_in = self.to_q(x)
+-    context = default(context, x)
+-
+-    context_k, context_v = hypernetwork.apply_hypernetworks(shared.loaded_hypernetworks, context)
+-    k_in = self.to_k(context_k)
+-    v_in = self.to_v(context_v)
+-    del context, context_k, context_v, x
+-
+-    q, k, v = (rearrange(t, 'b n (h d) -> (b h) n d', h=h) for t in (q_in, k_in, v_in))
+-    del q_in, k_in, v_in
+-
+-    dtype = q.dtype
+-    if shared.opts.upcast_attn:
+-        q, k, v = q.float(), k.float(), v.float()
+-
+-    with devices.without_autocast(disable=not shared.opts.upcast_attn):
+-        r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device, dtype=q.dtype)
+-        for i in range(0, q.shape[0], 2):
+-            end = i + 2
+-            s1 = einsum('b i d, b j d -> b i j', q[i:end], k[i:end])
+-            s1 *= self.scale
+-
+-            s2 = s1.softmax(dim=-1)
+-            del s1
+-
+-            r1[i:end] = einsum('b i j, b j d -> b i d', s2, v[i:end])
+-            del s2
+-        del q, k, v
+-
+-    r1 = r1.to(dtype)
+-
+-    r2 = rearrange(r1, '(b h) n d -> b n (h d)', h=h)
+-    del r1
+-
+-    return self.to_out(r2)
+-
+-
+-# taken from https://github.com/Doggettx/stable-diffusion and modified
+-def split_cross_attention_forward(self, x, context=None, mask=None, **kwargs):
+-    h = self.heads
+-
+-    q_in = self.to_q(x)
+-    context = default(context, x)
+-
+-    context_k, context_v = hypernetwork.apply_hypernetworks(shared.loaded_hypernetworks, context)
+-    k_in = self.to_k(context_k)
+-    v_in = self.to_v(context_v)
+-
+-    dtype = q_in.dtype
+-    if shared.opts.upcast_attn:
+-        q_in, k_in, v_in = q_in.float(), k_in.float(), v_in if v_in.device.type == 'mps' else v_in.float()
+-
+-    with devices.without_autocast(disable=not shared.opts.upcast_attn):
+-        k_in = k_in * self.scale
+-
+-        del context, x
+-
+-        q, k, v = (rearrange(t, 'b n (h d) -> (b h) n d', h=h) for t in (q_in, k_in, v_in))
+-        del q_in, k_in, v_in
+-
+-        r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device, dtype=q.dtype)
+-
+-        mem_free_total = get_available_vram()
+-
+-        gb = 1024 ** 3
+-        tensor_size = q.shape[0] * q.shape[1] * k.shape[1] * q.element_size()
+-        modifier = 3 if q.element_size() == 2 else 2.5
+-        mem_required = tensor_size * modifier
+-        steps = 1
+-
+-        if mem_required > mem_free_total:
+-            steps = 2 ** (math.ceil(math.log(mem_required / mem_free_total, 2)))
+-            # print(f"Expected tensor size:{tensor_size/gb:0.1f}GB, cuda free:{mem_free_cuda/gb:0.1f}GB "
+-            #       f"torch free:{mem_free_torch/gb:0.1f} total:{mem_free_total/gb:0.1f} steps:{steps}")
+-
+-        if steps > 64:
+-            max_res = math.floor(math.sqrt(math.sqrt(mem_free_total / 2.5)) / 8) * 64
+-            raise RuntimeError(f'Not enough memory, use lower resolution (max approx. {max_res}x{max_res}). '
+-                               f'Need: {mem_required / 64 / gb:0.1f}GB free, Have:{mem_free_total / gb:0.1f}GB free')
+-
+-        slice_size = q.shape[1] // steps
+-        for i in range(0, q.shape[1], slice_size):
+-            end = min(i + slice_size, q.shape[1])
+-            s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k)
+-
+-            s2 = s1.softmax(dim=-1, dtype=q.dtype)
+-            del s1
+-
+-            r1[:, i:end] = einsum('b i j, b j d -> b i d', s2, v)
+-            del s2
+-
+-        del q, k, v
+-
+-    r1 = r1.to(dtype)
+-
+-    r2 = rearrange(r1, '(b h) n d -> b n (h d)', h=h)
+-    del r1
+-
+-    return self.to_out(r2)
+-
+-
+-# -- Taken from https://github.com/invoke-ai/InvokeAI and modified --
+-mem_total_gb = psutil.virtual_memory().total // (1 << 30)
+-
+-
+-def einsum_op_compvis(q, k, v):
+-    s = einsum('b i d, b j d -> b i j', q, k)
+-    s = s.softmax(dim=-1, dtype=s.dtype)
+-    return einsum('b i j, b j d -> b i d', s, v)
+-
+-
+-def einsum_op_slice_0(q, k, v, slice_size):
+-    r = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device, dtype=q.dtype)
+-    for i in range(0, q.shape[0], slice_size):
+-        end = i + slice_size
+-        r[i:end] = einsum_op_compvis(q[i:end], k[i:end], v[i:end])
+-    return r
+-
+-
+-def einsum_op_slice_1(q, k, v, slice_size):
+-    r = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device, dtype=q.dtype)
+-    for i in range(0, q.shape[1], slice_size):
+-        end = i + slice_size
+-        r[:, i:end] = einsum_op_compvis(q[:, i:end], k, v)
+-    return r
+-
+-
+-def einsum_op_mps_v1(q, k, v):
+-    if q.shape[0] * q.shape[1] <= 2**16: # (512x512) max q.shape[1]: 4096
+-        return einsum_op_compvis(q, k, v)
+-    else:
+-        slice_size = math.floor(2**30 / (q.shape[0] * q.shape[1]))
+-        if slice_size % 4096 == 0:
+-            slice_size -= 1
+-        return einsum_op_slice_1(q, k, v, slice_size)
+-
+-
+-def einsum_op_mps_v2(q, k, v):
+-    if mem_total_gb > 8 and q.shape[0] * q.shape[1] <= 2**16:
+-        return einsum_op_compvis(q, k, v)
+-    else:
+-        return einsum_op_slice_0(q, k, v, 1)
+-
+-
+-def einsum_op_tensor_mem(q, k, v, max_tensor_mb):
+-    size_mb = q.shape[0] * q.shape[1] * k.shape[1] * q.element_size() // (1 << 20)
+-    if size_mb <= max_tensor_mb:
+-        return einsum_op_compvis(q, k, v)
+-    div = 1 << int((size_mb - 1) / max_tensor_mb).bit_length()
+-    if div <= q.shape[0]:
+-        return einsum_op_slice_0(q, k, v, q.shape[0] // div)
+-    return einsum_op_slice_1(q, k, v, max(q.shape[1] // div, 1))
+-
+-
+-def einsum_op_cuda(q, k, v):
+-    stats = torch.cuda.memory_stats(q.device)
+-    mem_active = stats['active_bytes.all.current']
+-    mem_reserved = stats['reserved_bytes.all.current']
+-    mem_free_cuda, _ = torch.cuda.mem_get_info(q.device)
+-    mem_free_torch = mem_reserved - mem_active
+-    mem_free_total = mem_free_cuda + mem_free_torch
+-    # Divide factor of safety as there's copying and fragmentation
+-    return einsum_op_tensor_mem(q, k, v, mem_free_total / 3.3 / (1 << 20))
+-
+-
+-def einsum_op(q, k, v):
+-    if q.device.type == 'cuda':
+-        return einsum_op_cuda(q, k, v)
+-
+-    if q.device.type == 'mps':
+-        if mem_total_gb >= 32 and q.shape[0] % 32 != 0 and q.shape[0] * q.shape[1] < 2**18:
+-            return einsum_op_mps_v1(q, k, v)
+-        return einsum_op_mps_v2(q, k, v)
+-
+-    # Smaller slices are faster due to L2/L3/SLC caches.
+-    # Tested on i7 with 8MB L3 cache.
+-    return einsum_op_tensor_mem(q, k, v, 32)
+-
+-
+-def split_cross_attention_forward_invokeAI(self, x, context=None, mask=None, **kwargs):
+-    h = self.heads
+-
+-    q = self.to_q(x)
+-    context = default(context, x)
+-
+-    context_k, context_v = hypernetwork.apply_hypernetworks(shared.loaded_hypernetworks, context)
+-    k = self.to_k(context_k)
+-    v = self.to_v(context_v)
+-    del context, context_k, context_v, x
+-
+-    dtype = q.dtype
+-    if shared.opts.upcast_attn:
+-        q, k, v = q.float(), k.float(), v if v.device.type == 'mps' else v.float()
+-
+-    with devices.without_autocast(disable=not shared.opts.upcast_attn):
+-        k = k * self.scale
+-
+-        q, k, v = (rearrange(t, 'b n (h d) -> (b h) n d', h=h) for t in (q, k, v))
+-        r = einsum_op(q, k, v)
+-    r = r.to(dtype)
+-    return self.to_out(rearrange(r, '(b h) n d -> b n (h d)', h=h))
+-
+-# -- End of code from https://github.com/invoke-ai/InvokeAI --
+-
+-
+-# Based on Birch-san's modified implementation of sub-quadratic attention from https://github.com/Birch-san/diffusers/pull/1
+-# The sub_quad_attention_forward function is under the MIT License listed under Memory Efficient Attention in the Licenses section of the web UI interface
+-def sub_quad_attention_forward(self, x, context=None, mask=None, **kwargs):
+-    assert mask is None, "attention-mask not currently implemented for SubQuadraticCrossAttnProcessor."
+-
+-    h = self.heads
+-
+-    q = self.to_q(x)
+-    context = default(context, x)
+-
+-    context_k, context_v = hypernetwork.apply_hypernetworks(shared.loaded_hypernetworks, context)
+-    k = self.to_k(context_k)
+-    v = self.to_v(context_v)
+-    del context, context_k, context_v, x
+-
+-    q = q.unflatten(-1, (h, -1)).transpose(1,2).flatten(end_dim=1)
+-    k = k.unflatten(-1, (h, -1)).transpose(1,2).flatten(end_dim=1)
+-    v = v.unflatten(-1, (h, -1)).transpose(1,2).flatten(end_dim=1)
+-
+-    if q.device.type == 'mps':
+-        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+-
+-    dtype = q.dtype
+-    if shared.opts.upcast_attn:
+-        q, k = q.float(), k.float()
+-
+-    x = sub_quad_attention(q, k, v, q_chunk_size=shared.cmd_opts.sub_quad_q_chunk_size, kv_chunk_size=shared.cmd_opts.sub_quad_kv_chunk_size, chunk_threshold=shared.cmd_opts.sub_quad_chunk_threshold, use_checkpoint=self.training)
+-
+-    x = x.to(dtype)
+-
+-    x = x.unflatten(0, (-1, h)).transpose(1,2).flatten(start_dim=2)
+-
+-    out_proj, dropout = self.to_out
+-    x = out_proj(x)
+-    x = dropout(x)
+-
+-    return x
+-
+-
+-def sub_quad_attention(q, k, v, q_chunk_size=1024, kv_chunk_size=None, kv_chunk_size_min=None, chunk_threshold=None, use_checkpoint=True):
+-    bytes_per_token = torch.finfo(q.dtype).bits//8
+-    batch_x_heads, q_tokens, _ = q.shape
+-    _, k_tokens, _ = k.shape
+-    qk_matmul_size_bytes = batch_x_heads * bytes_per_token * q_tokens * k_tokens
+-
+-    if chunk_threshold is None:
+-        if q.device.type == 'mps':
+-            chunk_threshold_bytes = 268435456 * (2 if platform.processor() == 'i386' else bytes_per_token)
+-        else:
+-            chunk_threshold_bytes = int(get_available_vram() * 0.7)
+-    elif chunk_threshold == 0:
+-        chunk_threshold_bytes = None
+-    else:
+-        chunk_threshold_bytes = int(0.01 * chunk_threshold * get_available_vram())
+-
+-    if kv_chunk_size_min is None and chunk_threshold_bytes is not None:
+-        kv_chunk_size_min = chunk_threshold_bytes // (batch_x_heads * bytes_per_token * (k.shape[2] + v.shape[2]))
+-    elif kv_chunk_size_min == 0:
+-        kv_chunk_size_min = None
+-
+-    if chunk_threshold_bytes is not None and qk_matmul_size_bytes <= chunk_threshold_bytes:
+-        # the big matmul fits into our memory limit; do everything in 1 chunk,
+-        # i.e. send it down the unchunked fast-path
+-        kv_chunk_size = k_tokens
+-
+-    with devices.without_autocast(disable=q.dtype == v.dtype):
+-        return sub_quadratic_attention.efficient_dot_product_attention(
+-            q,
+-            k,
+-            v,
+-            query_chunk_size=q_chunk_size,
+-            kv_chunk_size=kv_chunk_size,
+-            kv_chunk_size_min = kv_chunk_size_min,
+-            use_checkpoint=use_checkpoint,
+-        )
+-
+-
+-def get_xformers_flash_attention_op(q, k, v):
+-    if not shared.cmd_opts.xformers_flash_attention:
+-        return None
+-
+-    try:
+-        flash_attention_op = xformers.ops.MemoryEfficientAttentionFlashAttentionOp
+-        fw, bw = flash_attention_op
+-        if fw.supports(xformers.ops.fmha.Inputs(query=q, key=k, value=v, attn_bias=None)):
+-            return flash_attention_op
+-    except Exception as e:
+-        errors.display_once(e, "enabling flash attention")
+-
+-    return None
+-
+-
+-def xformers_attention_forward(self, x, context=None, mask=None, **kwargs):
+-    h = self.heads
+-    q_in = self.to_q(x)
+-    context = default(context, x)
+-
+-    context_k, context_v = hypernetwork.apply_hypernetworks(shared.loaded_hypernetworks, context)
+-    k_in = self.to_k(context_k)
+-    v_in = self.to_v(context_v)
+-
+-    q, k, v = (t.reshape(t.shape[0], t.shape[1], h, -1) for t in (q_in, k_in, v_in))
+-
+-    del q_in, k_in, v_in
+-
+-    dtype = q.dtype
+-    if shared.opts.upcast_attn:
+-        q, k, v = q.float(), k.float(), v.float()
+-
+-    out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=get_xformers_flash_attention_op(q, k, v))
+-
+-    out = out.to(dtype)
+-
+-    b, n, h, d = out.shape
+-    out = out.reshape(b, n, h * d)
+-    return self.to_out(out)
+-
+-
+-# Based on Diffusers usage of scaled dot product attention from https://github.com/huggingface/diffusers/blob/c7da8fd23359a22d0df2741688b5b4f33c26df21/src/diffusers/models/cross_attention.py
+-# The scaled_dot_product_attention_forward function contains parts of code under Apache-2.0 license listed under Scaled Dot Product Attention in the Licenses section of the web UI interface
+-def scaled_dot_product_attention_forward(self, x, context=None, mask=None, **kwargs):
+-    batch_size, sequence_length, inner_dim = x.shape
+-
+-    if mask is not None:
+-        mask = self.prepare_attention_mask(mask, sequence_length, batch_size)
+-        mask = mask.view(batch_size, self.heads, -1, mask.shape[-1])
+-
+-    h = self.heads
+-    q_in = self.to_q(x)
+-    context = default(context, x)
+-
+-    context_k, context_v = hypernetwork.apply_hypernetworks(shared.loaded_hypernetworks, context)
+-    k_in = self.to_k(context_k)
+-    v_in = self.to_v(context_v)
+-
+-    head_dim = inner_dim // h
+-    q = q_in.view(batch_size, -1, h, head_dim).transpose(1, 2)
+-    k = k_in.view(batch_size, -1, h, head_dim).transpose(1, 2)
+-    v = v_in.view(batch_size, -1, h, head_dim).transpose(1, 2)
+-
+-    del q_in, k_in, v_in
+-
+-    dtype = q.dtype
+-    if shared.opts.upcast_attn:
+-        q, k, v = q.float(), k.float(), v.float()
+-
+-    # the output of sdp = (batch, num_heads, seq_len, head_dim)
+-    hidden_states = torch.nn.functional.scaled_dot_product_attention(
+-        q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
+-    )
+-
+-    hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, h * head_dim)
+-    hidden_states = hidden_states.to(dtype)
+-
+-    # linear proj
+-    hidden_states = self.to_out[0](hidden_states)
+-    # dropout
+-    hidden_states = self.to_out[1](hidden_states)
+-    return hidden_states
+-
+-
+-def scaled_dot_product_no_mem_attention_forward(self, x, context=None, mask=None, **kwargs):
+-    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=False):
+-        return scaled_dot_product_attention_forward(self, x, context, mask)
+-
+-
+-def cross_attention_attnblock_forward(self, x):
+-        h_ = x
+-        h_ = self.norm(h_)
+-        q1 = self.q(h_)
+-        k1 = self.k(h_)
+-        v = self.v(h_)
+-
+-        # compute attention
+-        b, c, h, w = q1.shape
+-
+-        q2 = q1.reshape(b, c, h*w)
+-        del q1
+-
+-        q = q2.permute(0, 2, 1)   # b,hw,c
+-        del q2
+-
+-        k = k1.reshape(b, c, h*w) # b,c,hw
+-        del k1
+-
+-        h_ = torch.zeros_like(k, device=q.device)
+-
+-        mem_free_total = get_available_vram()
+-
+-        tensor_size = q.shape[0] * q.shape[1] * k.shape[2] * q.element_size()
+-        mem_required = tensor_size * 2.5
+-        steps = 1
+-
+-        if mem_required > mem_free_total:
+-            steps = 2**(math.ceil(math.log(mem_required / mem_free_total, 2)))
+-
+-        slice_size = q.shape[1] // steps if (q.shape[1] % steps) == 0 else q.shape[1]
+-        for i in range(0, q.shape[1], slice_size):
+-            end = i + slice_size
+-
+-            w1 = torch.bmm(q[:, i:end], k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
+-            w2 = w1 * (int(c)**(-0.5))
+-            del w1
+-            w3 = torch.nn.functional.softmax(w2, dim=2, dtype=q.dtype)
+-            del w2
+-
+-            # attend to values
+-            v1 = v.reshape(b, c, h*w)
+-            w4 = w3.permute(0, 2, 1)   # b,hw,hw (first hw of k, second of q)
+-            del w3
+-
+-            h_[:, :, i:end] = torch.bmm(v1, w4)     # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
+-            del v1, w4
+-
+-        h2 = h_.reshape(b, c, h, w)
+-        del h_
+-
+-        h3 = self.proj_out(h2)
+-        del h2
+-
+-        h3 += x
+-
+-        return h3
+-
+-
+-def xformers_attnblock_forward(self, x):
+-    try:
+-        h_ = x
+-        h_ = self.norm(h_)
+-        q = self.q(h_)
+-        k = self.k(h_)
+-        v = self.v(h_)
+-        b, c, h, w = q.shape
+-        q, k, v = (rearrange(t, 'b c h w -> b (h w) c') for t in (q, k, v))
+-        dtype = q.dtype
+-        if shared.opts.upcast_attn:
+-            q, k = q.float(), k.float()
+-        q = q.contiguous()
+-        k = k.contiguous()
+-        v = v.contiguous()
+-        out = xformers.ops.memory_efficient_attention(q, k, v, op=get_xformers_flash_attention_op(q, k, v))
+-        out = out.to(dtype)
+-        out = rearrange(out, 'b (h w) c -> b c h w', h=h)
+-        out = self.proj_out(out)
+-        return x + out
+-    except NotImplementedError:
+-        return cross_attention_attnblock_forward(self, x)
+-
+-
+-def sdp_attnblock_forward(self, x):
+-    h_ = x
+-    h_ = self.norm(h_)
+-    q = self.q(h_)
+-    k = self.k(h_)
+-    v = self.v(h_)
+-    b, c, h, w = q.shape
+-    q, k, v = (rearrange(t, 'b c h w -> b (h w) c') for t in (q, k, v))
+-    dtype = q.dtype
+-    if shared.opts.upcast_attn:
+-        q, k, v = q.float(), k.float(), v.float()
+-    q = q.contiguous()
+-    k = k.contiguous()
+-    v = v.contiguous()
+-    out = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+-    out = out.to(dtype)
+-    out = rearrange(out, 'b (h w) c -> b c h w', h=h)
+-    out = self.proj_out(out)
+-    return x + out
+-
+-
+-def sdp_no_mem_attnblock_forward(self, x):
+-    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=False):
+-        return sdp_attnblock_forward(self, x)
+-
+-
+-def sub_quad_attnblock_forward(self, x):
+-    h_ = x
+-    h_ = self.norm(h_)
+-    q = self.q(h_)
+-    k = self.k(h_)
+-    v = self.v(h_)
+-    b, c, h, w = q.shape
+-    q, k, v = (rearrange(t, 'b c h w -> b (h w) c') for t in (q, k, v))
+-    q = q.contiguous()
+-    k = k.contiguous()
+-    v = v.contiguous()
+-    out = sub_quad_attention(q, k, v, q_chunk_size=shared.cmd_opts.sub_quad_q_chunk_size, kv_chunk_size=shared.cmd_opts.sub_quad_kv_chunk_size, chunk_threshold=shared.cmd_opts.sub_quad_chunk_threshold, use_checkpoint=self.training)
+-    out = rearrange(out, 'b (h w) c -> b c h w', h=h)
+-    out = self.proj_out(out)
+-    return x + out
++from __future__ import annotations
++import math
++import psutil
++import platform
++
++import torch
++from torch import einsum
++
++from ldm.util import default
++from einops import rearrange
++
++from modules import shared, errors, devices, sub_quadratic_attention, sd_opt
++from modules.hypernetworks import hypernetwork
++
++import ldm.modules.attention
++import ldm.modules.diffusionmodules.model
++
++import sgm.modules.attention
++import sgm.modules.diffusionmodules.model
++
++diffusionmodules_model_AttnBlock_forward = ldm.modules.diffusionmodules.model.AttnBlock.forward
++sgm_diffusionmodules_model_AttnBlock_forward = sgm.modules.diffusionmodules.model.AttnBlock.forward
++
++
++class SdOptimization:
++    name: str = None
++    label: str | None = None
++    cmd_opt: str | None = None
++    priority: int = 0
++
++    def title(self):
++        if self.label is None:
++            return self.name
++
++        return f"{self.name} - {self.label}"
++
++    def is_available(self):
++        return True
++
++    def apply(self):
++        pass
++
++    def undo(self):
++        ldm.modules.attention.CrossAttention.forward = hypernetwork.attention_CrossAttention_forward
++        ldm.modules.diffusionmodules.model.AttnBlock.forward = diffusionmodules_model_AttnBlock_forward
++
++        sgm.modules.attention.CrossAttention.forward = hypernetwork.attention_CrossAttention_forward
++        sgm.modules.diffusionmodules.model.AttnBlock.forward = sgm_diffusionmodules_model_AttnBlock_forward
++
++
++class SdOptimizationXformers(SdOptimization):
++    name = "xformers"
++    cmd_opt = "xformers"
++    priority = 100
++
++    def is_available(self):
++        return shared.cmd_opts.force_enable_xformers or (shared.xformers_available and torch.cuda.is_available() and (6, 0) <= torch.cuda.get_device_capability(shared.device) <= (9, 0))
++
++    def apply(self):
++        ldm.modules.attention.CrossAttention.forward = xformers_attention_forward
++        ldm.modules.diffusionmodules.model.AttnBlock.forward = xformers_attnblock_forward
++        sgm.modules.attention.CrossAttention.forward = xformers_attention_forward
++        sgm.modules.diffusionmodules.model.AttnBlock.forward = xformers_attnblock_forward
++
++
++class SdOptimizationSdpNoMem(SdOptimization):
++    name = "sdp-no-mem"
++    label = "scaled dot product without memory efficient attention"
++    cmd_opt = "opt_sdp_no_mem_attention"
++    priority = 80
++
++    def is_available(self):
++        return hasattr(torch.nn.functional, "scaled_dot_product_attention") and callable(torch.nn.functional.scaled_dot_product_attention)
++
++    def apply(self):
++        ldm.modules.attention.CrossAttention.forward = scaled_dot_product_no_mem_attention_forward
++        ldm.modules.diffusionmodules.model.AttnBlock.forward = sdp_no_mem_attnblock_forward
++        sgm.modules.attention.CrossAttention.forward = scaled_dot_product_no_mem_attention_forward
++        sgm.modules.diffusionmodules.model.AttnBlock.forward = sdp_no_mem_attnblock_forward
++
++
++class SdOptimizationSdp(SdOptimizationSdpNoMem):
++    name = "sdp"
++    label = "scaled dot product"
++    cmd_opt = "opt_sdp_attention"
++
++    @property
++    def priority(self):
++        return 95 if torch.cuda.is_available() and sd_opt.enabled("OPT_1") else 70
++
++    def apply(self):
++        ldm.modules.attention.CrossAttention.forward = scaled_dot_product_attention_forward
++        ldm.modules.diffusionmodules.model.AttnBlock.forward = sdp_attnblock_forward
++        sgm.modules.attention.CrossAttention.forward = scaled_dot_product_attention_forward
++        sgm.modules.diffusionmodules.model.AttnBlock.forward = sdp_attnblock_forward
++
++
++class SdOptimizationSubQuad(SdOptimization):
++    name = "sub-quadratic"
++    cmd_opt = "opt_sub_quad_attention"
++
++    @property
++    def priority(self):
++        return 1000 if shared.device.type == 'mps' else 10
++
++    def apply(self):
++        ldm.modules.attention.CrossAttention.forward = sub_quad_attention_forward
++        ldm.modules.diffusionmodules.model.AttnBlock.forward = sub_quad_attnblock_forward
++        sgm.modules.attention.CrossAttention.forward = sub_quad_attention_forward
++        sgm.modules.diffusionmodules.model.AttnBlock.forward = sub_quad_attnblock_forward
++
++
++class SdOptimizationV1(SdOptimization):
++    name = "V1"
++    label = "original v1"
++    cmd_opt = "opt_split_attention_v1"
++    priority = 10
++
++    def apply(self):
++        ldm.modules.attention.CrossAttention.forward = split_cross_attention_forward_v1
++        sgm.modules.attention.CrossAttention.forward = split_cross_attention_forward_v1
++
++
++class SdOptimizationInvokeAI(SdOptimization):
++    name = "InvokeAI"
++    cmd_opt = "opt_split_attention_invokeai"
++
++    @property
++    def priority(self):
++        return 1000 if shared.device.type != 'mps' and not torch.cuda.is_available() else 10
++
++    def apply(self):
++        ldm.modules.attention.CrossAttention.forward = split_cross_attention_forward_invokeAI
++        sgm.modules.attention.CrossAttention.forward = split_cross_attention_forward_invokeAI
++
++
++class SdOptimizationDoggettx(SdOptimization):
++    name = "Doggettx"
++    cmd_opt = "opt_split_attention"
++    priority = 90
++
++    def apply(self):
++        ldm.modules.attention.CrossAttention.forward = split_cross_attention_forward
++        ldm.modules.diffusionmodules.model.AttnBlock.forward = cross_attention_attnblock_forward
++        sgm.modules.attention.CrossAttention.forward = split_cross_attention_forward
++        sgm.modules.diffusionmodules.model.AttnBlock.forward = cross_attention_attnblock_forward
++
++
++def list_optimizers(res):
++    res.extend([
++        SdOptimizationXformers(),
++        SdOptimizationSdpNoMem(),
++        SdOptimizationSdp(),
++        SdOptimizationSubQuad(),
++        SdOptimizationV1(),
++        SdOptimizationInvokeAI(),
++        SdOptimizationDoggettx(),
++    ])
++
++
++if shared.cmd_opts.xformers or shared.cmd_opts.force_enable_xformers:
++    try:
++        import xformers.ops
++        shared.xformers_available = True
++    except Exception:
++        errors.report("Cannot import xformers", exc_info=True)
++
++
++def get_available_vram():
++    if shared.device.type == 'cuda':
++        stats = torch.cuda.memory_stats(shared.device)
++        mem_active = stats['active_bytes.all.current']
++        mem_reserved = stats['reserved_bytes.all.current']
++        mem_free_cuda, _ = torch.cuda.mem_get_info(torch.cuda.current_device())
++        mem_free_torch = mem_reserved - mem_active
++        mem_free_total = mem_free_cuda + mem_free_torch
++        return mem_free_total
++    else:
++        return psutil.virtual_memory().available
++
++
++# see https://github.com/basujindal/stable-diffusion/pull/117 for discussion
++def split_cross_attention_forward_v1(self, x, context=None, mask=None, **kwargs):
++    h = self.heads
++
++    q_in = self.to_q(x)
++    context = default(context, x)
++
++    context_k, context_v = hypernetwork.apply_hypernetworks(shared.loaded_hypernetworks, context)
++    k_in = self.to_k(context_k)
++    v_in = self.to_v(context_v)
++    del context, context_k, context_v, x
++
++    q, k, v = (rearrange(t, 'b n (h d) -> (b h) n d', h=h) for t in (q_in, k_in, v_in))
++    del q_in, k_in, v_in
++
++    dtype = q.dtype
++    if shared.opts.upcast_attn:
++        q, k, v = q.float(), k.float(), v.float()
++
++    with devices.without_autocast(disable=not shared.opts.upcast_attn):
++        r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device, dtype=q.dtype)
++        for i in range(0, q.shape[0], 2):
++            end = i + 2
++            s1 = einsum('b i d, b j d -> b i j', q[i:end], k[i:end])
++            s1 *= self.scale
++
++            s2 = s1.softmax(dim=-1)
++            del s1
++
++            r1[i:end] = einsum('b i j, b j d -> b i d', s2, v[i:end])
++            del s2
++        del q, k, v
++
++    r1 = r1.to(dtype)
++
++    r2 = rearrange(r1, '(b h) n d -> b n (h d)', h=h)
++    del r1
++
++    return self.to_out(r2)
++
++
++# taken from https://github.com/Doggettx/stable-diffusion and modified
++def split_cross_attention_forward(self, x, context=None, mask=None, **kwargs):
++    h = self.heads
++
++    q_in = self.to_q(x)
++    context = default(context, x)
++
++    context_k, context_v = hypernetwork.apply_hypernetworks(shared.loaded_hypernetworks, context)
++    k_in = self.to_k(context_k)
++    v_in = self.to_v(context_v)
++
++    dtype = q_in.dtype
++    if shared.opts.upcast_attn:
++        q_in, k_in, v_in = q_in.float(), k_in.float(), v_in if v_in.device.type == 'mps' else v_in.float()
++
++    with devices.without_autocast(disable=not shared.opts.upcast_attn):
++        k_in = k_in * self.scale
++
++        del context, x
++
++        q, k, v = (rearrange(t, 'b n (h d) -> (b h) n d', h=h) for t in (q_in, k_in, v_in))
++        del q_in, k_in, v_in
++
++        r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device, dtype=q.dtype)
++
++        mem_free_total = get_available_vram()
++
++        gb = 1024 ** 3
++        tensor_size = q.shape[0] * q.shape[1] * k.shape[1] * q.element_size()
++        modifier = 3 if q.element_size() == 2 else 2.5
++        mem_required = tensor_size * modifier
++        steps = 1
++
++        if mem_required > mem_free_total:
++            steps = 2 ** (math.ceil(math.log(mem_required / mem_free_total, 2)))
++            # print(f"Expected tensor size:{tensor_size/gb:0.1f}GB, cuda free:{mem_free_cuda/gb:0.1f}GB "
++            #       f"torch free:{mem_free_torch/gb:0.1f} total:{mem_free_total/gb:0.1f} steps:{steps}")
++
++        if steps > 64:
++            max_res = math.floor(math.sqrt(math.sqrt(mem_free_total / 2.5)) / 8) * 64
++            raise RuntimeError(f'Not enough memory, use lower resolution (max approx. {max_res}x{max_res}). '
++                               f'Need: {mem_required / 64 / gb:0.1f}GB free, Have:{mem_free_total / gb:0.1f}GB free')
++
++        slice_size = q.shape[1] // steps
++        for i in range(0, q.shape[1], slice_size):
++            end = min(i + slice_size, q.shape[1])
++            s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k)
++
++            s2 = s1.softmax(dim=-1, dtype=q.dtype)
++            del s1
++
++            r1[:, i:end] = einsum('b i j, b j d -> b i d', s2, v)
++            del s2
++
++        del q, k, v
++
++    r1 = r1.to(dtype)
++
++    r2 = rearrange(r1, '(b h) n d -> b n (h d)', h=h)
++    del r1
++
++    return self.to_out(r2)
++
++
++# -- Taken from https://github.com/invoke-ai/InvokeAI and modified --
++mem_total_gb = psutil.virtual_memory().total // (1 << 30)
++
++
++def einsum_op_compvis(q, k, v):
++    s = einsum('b i d, b j d -> b i j', q, k)
++    s = s.softmax(dim=-1, dtype=s.dtype)
++    return einsum('b i j, b j d -> b i d', s, v)
++
++
++def einsum_op_slice_0(q, k, v, slice_size):
++    r = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device, dtype=q.dtype)
++    for i in range(0, q.shape[0], slice_size):
++        end = i + slice_size
++        r[i:end] = einsum_op_compvis(q[i:end], k[i:end], v[i:end])
++    return r
++
++
++def einsum_op_slice_1(q, k, v, slice_size):
++    r = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device, dtype=q.dtype)
++    for i in range(0, q.shape[1], slice_size):
++        end = i + slice_size
++        r[:, i:end] = einsum_op_compvis(q[:, i:end], k, v)
++    return r
++
++
++def einsum_op_mps_v1(q, k, v):
++    if q.shape[0] * q.shape[1] <= 2**16: # (512x512) max q.shape[1]: 4096
++        return einsum_op_compvis(q, k, v)
++    else:
++        slice_size = math.floor(2**30 / (q.shape[0] * q.shape[1]))
++        if slice_size % 4096 == 0:
++            slice_size -= 1
++        return einsum_op_slice_1(q, k, v, slice_size)
++
++
++def einsum_op_mps_v2(q, k, v):
++    if mem_total_gb > 8 and q.shape[0] * q.shape[1] <= 2**16:
++        return einsum_op_compvis(q, k, v)
++    else:
++        return einsum_op_slice_0(q, k, v, 1)
++
++
++def einsum_op_tensor_mem(q, k, v, max_tensor_mb):
++    size_mb = q.shape[0] * q.shape[1] * k.shape[1] * q.element_size() // (1 << 20)
++    if size_mb <= max_tensor_mb:
++        return einsum_op_compvis(q, k, v)
++    div = 1 << int((size_mb - 1) / max_tensor_mb).bit_length()
++    if div <= q.shape[0]:
++        return einsum_op_slice_0(q, k, v, q.shape[0] // div)
++    return einsum_op_slice_1(q, k, v, max(q.shape[1] // div, 1))
++
++
++def einsum_op_cuda(q, k, v):
++    stats = torch.cuda.memory_stats(q.device)
++    mem_active = stats['active_bytes.all.current']
++    mem_reserved = stats['reserved_bytes.all.current']
++    mem_free_cuda, _ = torch.cuda.mem_get_info(q.device)
++    mem_free_torch = mem_reserved - mem_active
++    mem_free_total = mem_free_cuda + mem_free_torch
++    # Divide factor of safety as there's copying and fragmentation
++    return einsum_op_tensor_mem(q, k, v, mem_free_total / 3.3 / (1 << 20))
++
++
++def einsum_op(q, k, v):
++    if q.device.type == 'cuda':
++        return einsum_op_cuda(q, k, v)
++
++    if q.device.type == 'mps':
++        if mem_total_gb >= 32 and q.shape[0] % 32 != 0 and q.shape[0] * q.shape[1] < 2**18:
++            return einsum_op_mps_v1(q, k, v)
++        return einsum_op_mps_v2(q, k, v)
++
++    # Smaller slices are faster due to L2/L3/SLC caches.
++    # Tested on i7 with 8MB L3 cache.
++    return einsum_op_tensor_mem(q, k, v, 32)
++
++
++def split_cross_attention_forward_invokeAI(self, x, context=None, mask=None, **kwargs):
++    h = self.heads
++
++    q = self.to_q(x)
++    context = default(context, x)
++
++    context_k, context_v = hypernetwork.apply_hypernetworks(shared.loaded_hypernetworks, context)
++    k = self.to_k(context_k)
++    v = self.to_v(context_v)
++    del context, context_k, context_v, x
++
++    dtype = q.dtype
++    if shared.opts.upcast_attn:
++        q, k, v = q.float(), k.float(), v if v.device.type == 'mps' else v.float()
++
++    with devices.without_autocast(disable=not shared.opts.upcast_attn):
++        k = k * self.scale
++
++        q, k, v = (rearrange(t, 'b n (h d) -> (b h) n d', h=h) for t in (q, k, v))
++        r = einsum_op(q, k, v)
++    r = r.to(dtype)
++    return self.to_out(rearrange(r, '(b h) n d -> b n (h d)', h=h))
++
++# -- End of code from https://github.com/invoke-ai/InvokeAI --
++
++
++# Based on Birch-san's modified implementation of sub-quadratic attention from https://github.com/Birch-san/diffusers/pull/1
++# The sub_quad_attention_forward function is under the MIT License listed under Memory Efficient Attention in the Licenses section of the web UI interface
++def sub_quad_attention_forward(self, x, context=None, mask=None, **kwargs):
++    assert mask is None, "attention-mask not currently implemented for SubQuadraticCrossAttnProcessor."
++
++    h = self.heads
++
++    q = self.to_q(x)
++    context = default(context, x)
++
++    context_k, context_v = hypernetwork.apply_hypernetworks(shared.loaded_hypernetworks, context)
++    k = self.to_k(context_k)
++    v = self.to_v(context_v)
++    del context, context_k, context_v, x
++
++    q = q.unflatten(-1, (h, -1)).transpose(1,2).flatten(end_dim=1)
++    k = k.unflatten(-1, (h, -1)).transpose(1,2).flatten(end_dim=1)
++    v = v.unflatten(-1, (h, -1)).transpose(1,2).flatten(end_dim=1)
++
++    if q.device.type == 'mps':
++        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
++
++    dtype = q.dtype
++    if shared.opts.upcast_attn:
++        q, k = q.float(), k.float()
++
++    x = sub_quad_attention(q, k, v, q_chunk_size=shared.cmd_opts.sub_quad_q_chunk_size, kv_chunk_size=shared.cmd_opts.sub_quad_kv_chunk_size, chunk_threshold=shared.cmd_opts.sub_quad_chunk_threshold, use_checkpoint=self.training)
++
++    x = x.to(dtype)
++
++    x = x.unflatten(0, (-1, h)).transpose(1,2).flatten(start_dim=2)
++
++    out_proj, dropout = self.to_out
++    x = out_proj(x)
++    x = dropout(x)
++
++    return x
++
++
++def sub_quad_attention(q, k, v, q_chunk_size=1024, kv_chunk_size=None, kv_chunk_size_min=None, chunk_threshold=None, use_checkpoint=True):
++    bytes_per_token = torch.finfo(q.dtype).bits//8
++    batch_x_heads, q_tokens, _ = q.shape
++    _, k_tokens, _ = k.shape
++    qk_matmul_size_bytes = batch_x_heads * bytes_per_token * q_tokens * k_tokens
++
++    if chunk_threshold is None:
++        if q.device.type == 'mps':
++            chunk_threshold_bytes = 268435456 * (2 if platform.processor() == 'i386' else bytes_per_token)
++        else:
++            chunk_threshold_bytes = int(get_available_vram() * 0.7)
++    elif chunk_threshold == 0:
++        chunk_threshold_bytes = None
++    else:
++        chunk_threshold_bytes = int(0.01 * chunk_threshold * get_available_vram())
++
++    if kv_chunk_size_min is None and chunk_threshold_bytes is not None:
++        kv_chunk_size_min = chunk_threshold_bytes // (batch_x_heads * bytes_per_token * (k.shape[2] + v.shape[2]))
++    elif kv_chunk_size_min == 0:
++        kv_chunk_size_min = None
++
++    if chunk_threshold_bytes is not None and qk_matmul_size_bytes <= chunk_threshold_bytes:
++        # the big matmul fits into our memory limit; do everything in 1 chunk,
++        # i.e. send it down the unchunked fast-path
++        kv_chunk_size = k_tokens
++
++    with devices.without_autocast(disable=q.dtype == v.dtype):
++        return sub_quadratic_attention.efficient_dot_product_attention(
++            q,
++            k,
++            v,
++            query_chunk_size=q_chunk_size,
++            kv_chunk_size=kv_chunk_size,
++            kv_chunk_size_min = kv_chunk_size_min,
++            use_checkpoint=use_checkpoint,
++        )
++
++
++def get_xformers_flash_attention_op(q, k, v):
++    if not shared.cmd_opts.xformers_flash_attention:
++        return None
++
++    try:
++        flash_attention_op = xformers.ops.MemoryEfficientAttentionFlashAttentionOp
++        fw, bw = flash_attention_op
++        if fw.supports(xformers.ops.fmha.Inputs(query=q, key=k, value=v, attn_bias=None)):
++            return flash_attention_op
++    except Exception as e:
++        errors.display_once(e, "enabling flash attention")
++
++    return None
++
++
++def xformers_attention_forward(self, x, context=None, mask=None, **kwargs):
++    h = self.heads
++    q_in = self.to_q(x)
++    context = default(context, x)
++
++    context_k, context_v = hypernetwork.apply_hypernetworks(shared.loaded_hypernetworks, context)
++    k_in = self.to_k(context_k)
++    v_in = self.to_v(context_v)
++
++    q, k, v = (t.reshape(t.shape[0], t.shape[1], h, -1) for t in (q_in, k_in, v_in))
++
++    del q_in, k_in, v_in
++
++    dtype = q.dtype
++    if shared.opts.upcast_attn:
++        q, k, v = q.float(), k.float(), v.float()
++
++    out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=get_xformers_flash_attention_op(q, k, v))
++
++    out = out.to(dtype)
++
++    b, n, h, d = out.shape
++    out = out.reshape(b, n, h * d)
++    return self.to_out(out)
++
++
++# Based on Diffusers usage of scaled dot product attention from https://github.com/huggingface/diffusers/blob/c7da8fd23359a22d0df2741688b5b4f33c26df21/src/diffusers/models/cross_attention.py
++# The scaled_dot_product_attention_forward function contains parts of code under Apache-2.0 license listed under Scaled Dot Product Attention in the Licenses section of the web UI interface
++def scaled_dot_product_attention_forward(self, x, context=None, mask=None, **kwargs):
++    batch_size, sequence_length, inner_dim = x.shape
++
++    if mask is not None:
++        mask = self.prepare_attention_mask(mask, sequence_length, batch_size)
++        mask = mask.view(batch_size, self.heads, -1, mask.shape[-1])
++
++    h = self.heads
++    q_in = self.to_q(x)
++    context = default(context, x)
++
++    context_k, context_v = hypernetwork.apply_hypernetworks(shared.loaded_hypernetworks, context)
++    k_in = self.to_k(context_k)
++    v_in = self.to_v(context_v)
++
++    head_dim = inner_dim // h
++    q = q_in.view(batch_size, -1, h, head_dim).transpose(1, 2)
++    k = k_in.view(batch_size, -1, h, head_dim).transpose(1, 2)
++    v = v_in.view(batch_size, -1, h, head_dim).transpose(1, 2)
++
++    del q_in, k_in, v_in
++
++    dtype = q.dtype
++    if shared.opts.upcast_attn:
++        q, k, v = q.float(), k.float(), v.float()
++
++    # the output of sdp = (batch, num_heads, seq_len, head_dim)
++    hidden_states = torch.nn.functional.scaled_dot_product_attention(
++        q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
++    )
++
++    hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, h * head_dim)
++    hidden_states = hidden_states.to(dtype)
++
++    # linear proj
++    hidden_states = self.to_out[0](hidden_states)
++    # dropout
++    hidden_states = self.to_out[1](hidden_states)
++    return hidden_states
++
++
++def scaled_dot_product_no_mem_attention_forward(self, x, context=None, mask=None, **kwargs):
++    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=False):
++        return scaled_dot_product_attention_forward(self, x, context, mask)
++
++
++def cross_attention_attnblock_forward(self, x):
++        h_ = x
++        h_ = self.norm(h_)
++        q1 = self.q(h_)
++        k1 = self.k(h_)
++        v = self.v(h_)
++
++        # compute attention
++        b, c, h, w = q1.shape
++
++        q2 = q1.reshape(b, c, h*w)
++        del q1
++
++        q = q2.permute(0, 2, 1)   # b,hw,c
++        del q2
++
++        k = k1.reshape(b, c, h*w) # b,c,hw
++        del k1
++
++        h_ = torch.zeros_like(k, device=q.device)
++
++        mem_free_total = get_available_vram()
++
++        tensor_size = q.shape[0] * q.shape[1] * k.shape[2] * q.element_size()
++        mem_required = tensor_size * 2.5
++        steps = 1
++
++        if mem_required > mem_free_total:
++            steps = 2**(math.ceil(math.log(mem_required / mem_free_total, 2)))
++
++        slice_size = q.shape[1] // steps if (q.shape[1] % steps) == 0 else q.shape[1]
++        for i in range(0, q.shape[1], slice_size):
++            end = i + slice_size
++
++            w1 = torch.bmm(q[:, i:end], k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
++            w2 = w1 * (int(c)**(-0.5))
++            del w1
++            w3 = torch.nn.functional.softmax(w2, dim=2, dtype=q.dtype)
++            del w2
++
++            # attend to values
++            v1 = v.reshape(b, c, h*w)
++            w4 = w3.permute(0, 2, 1)   # b,hw,hw (first hw of k, second of q)
++            del w3
++
++            h_[:, :, i:end] = torch.bmm(v1, w4)     # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
++            del v1, w4
++
++        h2 = h_.reshape(b, c, h, w)
++        del h_
++
++        h3 = self.proj_out(h2)
++        del h2
++
++        h3 += x
++
++        return h3
++
++
++def xformers_attnblock_forward(self, x):
++    try:
++        h_ = x
++        h_ = self.norm(h_)
++        q = self.q(h_)
++        k = self.k(h_)
++        v = self.v(h_)
++        b, c, h, w = q.shape
++        q, k, v = (rearrange(t, 'b c h w -> b (h w) c') for t in (q, k, v))
++        dtype = q.dtype
++        if shared.opts.upcast_attn:
++            q, k = q.float(), k.float()
++        q = q.contiguous()
++        k = k.contiguous()
++        v = v.contiguous()
++        out = xformers.ops.memory_efficient_attention(q, k, v, op=get_xformers_flash_attention_op(q, k, v))
++        out = out.to(dtype)
++        out = rearrange(out, 'b (h w) c -> b c h w', h=h)
++        out = self.proj_out(out)
++        return x + out
++    except NotImplementedError:
++        return cross_attention_attnblock_forward(self, x)
++
++
++def sdp_attnblock_forward(self, x):
++    h_ = x
++    h_ = self.norm(h_)
++    q = self.q(h_)
++    k = self.k(h_)
++    v = self.v(h_)
++    b, c, h, w = q.shape
++    q, k, v = (rearrange(t, 'b c h w -> b (h w) c') for t in (q, k, v))
++    dtype = q.dtype
++    if shared.opts.upcast_attn:
++        q, k, v = q.float(), k.float(), v.float()
++    q = q.contiguous()
++    k = k.contiguous()
++    v = v.contiguous()
++    out = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
++    out = out.to(dtype)
++    out = rearrange(out, 'b (h w) c -> b c h w', h=h)
++    out = self.proj_out(out)
++    return x + out
++
++
++def sdp_no_mem_attnblock_forward(self, x):
++    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=False):
++        return sdp_attnblock_forward(self, x)
++
++
++def sub_quad_attnblock_forward(self, x):
++    h_ = x
++    h_ = self.norm(h_)
++    q = self.q(h_)
++    k = self.k(h_)
++    v = self.v(h_)
++    b, c, h, w = q.shape
++    q, k, v = (rearrange(t, 'b c h w -> b (h w) c') for t in (q, k, v))
++    q = q.contiguous()
++    k = k.contiguous()
++    v = v.contiguous()
++    out = sub_quad_attention(q, k, v, q_chunk_size=shared.cmd_opts.sub_quad_q_chunk_size, kv_chunk_size=shared.cmd_opts.sub_quad_kv_chunk_size, chunk_threshold=shared.cmd_opts.sub_quad_chunk_threshold, use_checkpoint=self.training)
++    out = rearrange(out, 'b (h w) c -> b c h w', h=h)
++    out = self.proj_out(out)
++    return x + out
+diff --git a/modules/sd_opt.py b/modules/sd_opt.py
+new file mode 100644
+index 0000000..ad65de0
+--- /dev/null
++++ b/modules/sd_opt.py
+@@ -0,0 +1,161 @@
++import os
++import sys
++
++
++def enabled(name, default="1"):
++    return os.environ.get(f"SD_WEBUI_{name}", default).strip().lower() not in ("0", "false", "no", "off")
++
++
++def png_compress_level():
++    try:
++        return int(os.environ.get("SD_WEBUI_PNG_COMPRESS_LEVEL", "1"))
++    except ValueError:
++        return 1
++
++
++def _low_vram():
++    from modules import shared
++    o = shared.cmd_opts
++    return bool(getattr(o, "lowvram", False) or getattr(o, "medvram", False) or getattr(o, "medvram_sdxl", False))
++
++
++def apply(m):
++    import torch
++    if not torch.cuda.is_available() or getattr(m, "model", None) is None:
++        return
++    unet = getattr(m.model, "diffusion_model", None)
++    if unet is None:
++        return
++
++    if enabled("OPT_2") and not _low_vram():
++        unet.to(memory_format=torch.channels_last)
++        vae = getattr(m, "first_stage_model", None)
++        if vae is not None:
++            vae.to(memory_format=torch.channels_last)
++
++    if enabled("OPT_5", default="0") and not _low_vram():
++        _opt_6()
++
++    if enabled("OPT_3") and not _low_vram():
++        if not isinstance(unet.__dict__.get("forward"), UNetOpt7):
++            UNetOpt7(unet).install()
++
++
++def _opt_6():
++    import torch
++    import ldm.modules.attention as attention
++    import ldm.modules.diffusionmodules.openaimodel as openaimodel
++
++    for cls in (openaimodel.ResBlock, attention.BasicTransformerBlock):
++        if getattr(cls, "_sd_opt_eager", None) is not None:
++            continue
++        eager = cls._forward
++        compiled = torch.compile(eager)
++        state = {"ok": True}
++
++        def _forward(self, *args, _eager=eager, _opt_12=compiled, _state=state, _name=cls.__name__, **kwargs):
++            if _state["ok"] and not torch.is_grad_enabled():
++                try:
++                    return _opt_12(self, *args, **kwargs)
++                except Exception as e:  # noqa: BLE001
++                    _state["ok"] = False
++                    print(f"optimizing {_name} failed ({type(e).__name__}: {str(e)[:200]}); using the stock path")
++            return _eager(self, *args, **kwargs)
++
++        cls._sd_opt_eager = eager
++        cls._forward = _forward
++
++
++def undo(m):
++    unet = getattr(getattr(m, "model", None), "diffusion_model", None)
++    if unet is not None and isinstance(unet.__dict__.get("forward"), UNetOpt7):
++        del unet.forward
++
++
++def _networks_signature():
++    from modules import shared
++    names = []
++    nets = sys.modules.get("networks")                     # extensions-builtin/Lora
++    for n in getattr(nets, "loaded_networks", None) or []:
++        names.append(("lora", getattr(n, "name", repr(n)), getattr(n, "te_multiplier", None), getattr(n, "unet_multiplier", None)))
++    for h in getattr(shared, "loaded_hypernetworks", None) or []:
++        names.append(("hypernet", getattr(h, "name", repr(h)), getattr(h, "multiplier", None)))
++    return tuple(names)
++
++
++class UNetOpt7:
++
++    MAX_OPT_9 = 8
++
++    def __init__(self, unet):
++        self.unet = unet
++        self.eager = unet.forward
++        self.opt_10 = {}
++        self.failed = set()
++        self.last_networks = ()
++        self.stats = {"hits_a": 0, "hits_b": 0, "eager": 0, "failed": 0}
++
++    def install(self):
++        self.unet.forward = self
++
++    def _weights_key(self):
++        ps = list(self.unet.parameters())
++        return (ps[0].data_ptr(), ps[-1].data_ptr(), ps[0].dtype) if ps else ()
++
++    def __call__(self, x, timesteps=None, context=None, *args, **kwargs):
++        import torch
++        from modules import sd_hijack, sd_unet, shared
++
++        nets = _networks_signature()
++        changed = nets != self.last_networks
++        self.last_networks = nets
++        if (changed or nets or args or kwargs or sd_unet.current_unet is not None
++                or not torch.is_tensor(timesteps) or not torch.is_tensor(context)
++                or not x.is_cuda or torch.is_grad_enabled()):
++            self.stats["eager"] += 1
++            return self.eager(x, timesteps, context, *args, **kwargs)
++
++        key = (tuple(x.shape), x.dtype, tuple(timesteps.shape), timesteps.dtype,
++               tuple(context.shape), context.dtype, x.device,
++               torch.is_autocast_enabled(), torch.get_autocast_gpu_dtype(),
++               getattr(sd_hijack.current_optimizer, "name", None), bool(shared.opts.upcast_attn),
++               self._weights_key())
++        if key in self.failed:
++            return self.eager(x, timesteps, context)
++
++        entry = self.opt_10.get(key)
++        if entry is None:
++            if len(self.opt_10) >= self.MAX_OPT_9:
++                self.opt_10.clear()
++            try:
++                entry = self._opt_8(x, timesteps, context)
++            except Exception as e:  # noqa: BLE001 -- never fail a generation over a graph
++                print(f"UNet optimized path failed ({type(e).__name__}: {e}); using the stock path for this shape")
++                self.failed.add(key)
++                self.stats["failed"] += 1
++                torch.cuda.synchronize()
++                return self.eager(x, timesteps, context)
++            self.opt_10[key] = entry
++            self.stats["hits_a"] += 1
++
++        graph, sx, st, sc, out = entry
++        sx.copy_(x)
++        st.copy_(timesteps)
++        sc.copy_(context)
++        graph.replay()
++        self.stats["hits_b"] += 1
++        return out.clone()
++
++    def _opt_8(self, x, timesteps, context):
++        import torch
++        sx, st, sc = x.clone(), timesteps.clone(), context.clone()
++        side = torch.cuda.Stream()
++        side.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(side):
++            for _ in range(2):
++                self.eager(sx, st, sc)
++        torch.cuda.current_stream().wait_stream(side)
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
++            out = self.eager(sx, st, sc)
++        return graph, sx, st, sc, out
+diff --git a/scripts/prompts_from_file.py b/scripts/prompts_from_file.py
+index a4a2f24..405196c 100644
+--- a/scripts/prompts_from_file.py
++++ b/scripts/prompts_from_file.py
+@@ -1,191 +1,191 @@
+-import copy
+-import random
+-import shlex
+-
+-import modules.scripts as scripts
+-import gradio as gr
+-
+-from modules import sd_samplers, errors, sd_models
+-from modules.processing import Processed, process_images
+-from modules.shared import state
+-
+-
+-def process_model_tag(tag):
+-    info = sd_models.get_closet_checkpoint_match(tag)
+-    assert info is not None, f'Unknown checkpoint: {tag}'
+-    return info.name
+-
+-
+-def process_string_tag(tag):
+-    return tag
+-
+-
+-def process_int_tag(tag):
+-    return int(tag)
+-
+-
+-def process_float_tag(tag):
+-    return float(tag)
+-
+-
+-def process_boolean_tag(tag):
+-    return True if (tag == "true") else False
+-
+-
+-prompt_tags = {
+-    "sd_model": process_model_tag,
+-    "outpath_samples": process_string_tag,
+-    "outpath_grids": process_string_tag,
+-    "prompt_for_display": process_string_tag,
+-    "prompt": process_string_tag,
+-    "negative_prompt": process_string_tag,
+-    "styles": process_string_tag,
+-    "seed": process_int_tag,
+-    "subseed_strength": process_float_tag,
+-    "subseed": process_int_tag,
+-    "seed_resize_from_h": process_int_tag,
+-    "seed_resize_from_w": process_int_tag,
+-    "sampler_index": process_int_tag,
+-    "sampler_name": process_string_tag,
+-    "batch_size": process_int_tag,
+-    "n_iter": process_int_tag,
+-    "steps": process_int_tag,
+-    "cfg_scale": process_float_tag,
+-    "width": process_int_tag,
+-    "height": process_int_tag,
+-    "restore_faces": process_boolean_tag,
+-    "tiling": process_boolean_tag,
+-    "do_not_save_samples": process_boolean_tag,
+-    "do_not_save_grid": process_boolean_tag
+-}
+-
+-
+-def cmdargs(line):
+-    args = shlex.split(line)
+-    pos = 0
+-    res = {}
+-
+-    while pos < len(args):
+-        arg = args[pos]
+-
+-        assert arg.startswith("--"), f'must start with "--": {arg}'
+-        assert pos+1 < len(args), f'missing argument for command line option {arg}'
+-
+-        tag = arg[2:]
+-
+-        if tag == "prompt" or tag == "negative_prompt":
+-            pos += 1
+-            prompt = args[pos]
+-            pos += 1
+-            while pos < len(args) and not args[pos].startswith("--"):
+-                prompt += " "
+-                prompt += args[pos]
+-                pos += 1
+-            res[tag] = prompt
+-            continue
+-
+-
+-        func = prompt_tags.get(tag, None)
+-        assert func, f'unknown commandline option: {arg}'
+-
+-        val = args[pos+1]
+-        if tag == "sampler_name":
+-            val = sd_samplers.samplers_map.get(val.lower(), None)
+-
+-        res[tag] = func(val)
+-
+-        pos += 2
+-
+-    return res
+-
+-
+-def load_prompt_file(file):
+-    if file is None:
+-        return None, gr.update(), gr.update(lines=7)
+-    else:
+-        lines = [x.strip() for x in file.decode('utf8', errors='ignore').split("\n")]
+-        return None, "\n".join(lines), gr.update(lines=7)
+-
+-
+-class Script(scripts.Script):
+-    def title(self):
+-        return "Prompts from file or textbox"
+-
+-    def ui(self, is_img2img):
+-        checkbox_iterate = gr.Checkbox(label="Iterate seed every line", value=False, elem_id=self.elem_id("checkbox_iterate"))
+-        checkbox_iterate_batch = gr.Checkbox(label="Use same random seed for all lines", value=False, elem_id=self.elem_id("checkbox_iterate_batch"))
+-        prompt_position = gr.Radio(["start", "end"], label="Insert prompts at the", elem_id=self.elem_id("prompt_position"), value="start")
+-
+-        prompt_txt = gr.Textbox(label="List of prompt inputs", lines=1, elem_id=self.elem_id("prompt_txt"))
+-        file = gr.File(label="Upload prompt inputs", type='binary', elem_id=self.elem_id("file"))
+-
+-        file.change(fn=load_prompt_file, inputs=[file], outputs=[file, prompt_txt, prompt_txt], show_progress=False)
+-
+-        # We start at one line. When the text changes, we jump to seven lines, or two lines if no \n.
+-        # We don't shrink back to 1, because that causes the control to ignore [enter], and it may
+-        # be unclear to the user that shift-enter is needed.
+-        prompt_txt.change(lambda tb: gr.update(lines=7) if ("\n" in tb) else gr.update(lines=2), inputs=[prompt_txt], outputs=[prompt_txt], show_progress=False)
+-        return [checkbox_iterate, checkbox_iterate_batch, prompt_position, prompt_txt]
+-
+-    def run(self, p, checkbox_iterate, checkbox_iterate_batch, prompt_position, prompt_txt: str):
+-        lines = [x for x in (x.strip() for x in prompt_txt.splitlines()) if x]
+-
+-        p.do_not_save_grid = True
+-
+-        job_count = 0
+-        jobs = []
+-
+-        for line in lines:
+-            if "--" in line:
+-                try:
+-                    args = cmdargs(line)
+-                except Exception:
+-                    errors.report(f"Error parsing line {line} as commandline", exc_info=True)
+-                    args = {"prompt": line}
+-            else:
+-                args = {"prompt": line}
+-
+-            job_count += args.get("n_iter", p.n_iter)
+-
+-            jobs.append(args)
+-
+-        print(f"Will process {len(lines)} lines in {job_count} jobs.")
+-        if (checkbox_iterate or checkbox_iterate_batch) and p.seed == -1:
+-            p.seed = int(random.randrange(4294967294))
+-
+-        state.job_count = job_count
+-
+-        images = []
+-        all_prompts = []
+-        infotexts = []
+-        for args in jobs:
+-            state.job = f"{state.job_no + 1} out of {state.job_count}"
+-
+-            copy_p = copy.copy(p)
+-            for k, v in args.items():
+-                if k == "sd_model":
+-                    copy_p.override_settings['sd_model_checkpoint'] = v
+-                else:
+-                    setattr(copy_p, k, v)
+-
+-            if args.get("prompt") and p.prompt:
+-                if prompt_position == "start":
+-                    copy_p.prompt = args.get("prompt") + " " + p.prompt
+-                else:
+-                    copy_p.prompt = p.prompt + " " + args.get("prompt")
+-
+-            if args.get("negative_prompt") and p.negative_prompt:
+-                if prompt_position == "start":
+-                    copy_p.negative_prompt = args.get("negative_prompt") + " " + p.negative_prompt
+-                else:
+-                    copy_p.negative_prompt = p.negative_prompt + " " + args.get("negative_prompt")
+-
+-            proc = process_images(copy_p)
+-            images += proc.images
+-
+-            if checkbox_iterate:
+-                p.seed = p.seed + (p.batch_size * p.n_iter)
+-            all_prompts += proc.all_prompts
+-            infotexts += proc.infotexts
+-
+-        return Processed(p, images, p.seed, "", all_prompts=all_prompts, infotexts=infotexts)
++import copy
++import random
++import shlex
++
++import modules.scripts as scripts
++import gradio as gr
++
++from modules import sd_samplers, errors, sd_models
++from modules.processing import Processed, process_images
++from modules.shared import state
++
++
++def process_model_tag(tag):
++    info = sd_models.get_closet_checkpoint_match(tag)
++    assert info is not None, f'Unknown checkpoint: {tag}'
++    return info.name
++
++
++def process_string_tag(tag):
++    return tag
++
++
++def process_int_tag(tag):
++    return int(tag)
++
++
++def process_float_tag(tag):
++    return float(tag)
++
++
++def process_boolean_tag(tag):
++    return True if (tag == "true") else False
++
++
++prompt_tags = {
++    "sd_model": process_model_tag,
++    "outpath_samples": process_string_tag,
++    "outpath_grids": process_string_tag,
++    "prompt_for_display": process_string_tag,
++    "prompt": process_string_tag,
++    "negative_prompt": process_string_tag,
++    "styles": process_string_tag,
++    "seed": process_int_tag,
++    "subseed_strength": process_float_tag,
++    "subseed": process_int_tag,
++    "seed_resize_from_h": process_int_tag,
++    "seed_resize_from_w": process_int_tag,
++    "sampler_index": process_int_tag,
++    "sampler_name": process_string_tag,
++    "batch_size": process_int_tag,
++    "n_iter": process_int_tag,
++    "steps": process_int_tag,
++    "cfg_scale": process_float_tag,
++    "width": process_int_tag,
++    "height": process_int_tag,
++    "restore_faces": process_boolean_tag,
++    "tiling": process_boolean_tag,
++    "do_not_save_samples": process_boolean_tag,
++    "do_not_save_grid": process_boolean_tag
++}
++
++
++def cmdargs(line):
++    args = shlex.split(line)
++    pos = 0
++    res = {}
++
++    while pos < len(args):
++        arg = args[pos]
++
++        assert arg.startswith("--"), f'must start with "--": {arg}'
++        assert pos+1 < len(args), f'missing argument for command line option {arg}'
++
++        tag = arg[2:]
++
++        if tag == "prompt" or tag == "negative_prompt":
++            pos += 1
++            prompt = args[pos]
++            pos += 1
++            while pos < len(args) and not args[pos].startswith("--"):
++                prompt += " "
++                prompt += args[pos]
++                pos += 1
++            res[tag] = prompt
++            continue
++
++
++        func = prompt_tags.get(tag, None)
++        assert func, f'unknown commandline option: {arg}'
++
++        val = args[pos+1]
++        if tag == "sampler_name":
++            val = sd_samplers.samplers_map.get(val.lower(), None)
++
++        res[tag] = func(val)
++
++        pos += 2
++
++    return res
++
++
++def load_prompt_file(file):
++    if file is None:
++        return None, gr.update(), gr.update(lines=7)
++    else:
++        lines = [x.strip() for x in file.decode('utf8', errors='ignore').split("\n")]
++        return None, "\n".join(lines), gr.update(lines=7)
++
++
++class Script(scripts.Script):
++    def title(self):
++        return "Prompts from file or textbox"
++
++    def ui(self, is_img2img):
++        checkbox_iterate = gr.Checkbox(label="Iterate seed every line", value=False, elem_id=self.elem_id("checkbox_iterate"))
++        checkbox_iterate_batch = gr.Checkbox(label="Use same random seed for all lines", value=False, elem_id=self.elem_id("checkbox_iterate_batch"))
++        prompt_position = gr.Radio(["start", "end"], label="Insert prompts at the", elem_id=self.elem_id("prompt_position"), value="start")
++
++        prompt_txt = gr.Textbox(label="List of prompt inputs", lines=1, elem_id=self.elem_id("prompt_txt"))
++        file = gr.File(label="Upload prompt inputs", type='binary', elem_id=self.elem_id("file"))
++
++        file.change(fn=load_prompt_file, inputs=[file], outputs=[file, prompt_txt, prompt_txt], show_progress=False)
++
++        # We start at one line. When the text changes, we jump to seven lines, or two lines if no \n.
++        # We don't shrink back to 1, because that causes the control to ignore [enter], and it may
++        # be unclear to the user that shift-enter is needed.
++        prompt_txt.change(lambda tb: gr.update(lines=7) if ("\n" in tb) else gr.update(lines=2), inputs=[prompt_txt], outputs=[prompt_txt], show_progress=False)
++        return [checkbox_iterate, checkbox_iterate_batch, prompt_position, prompt_txt]
++
++    def run(self, p, checkbox_iterate, checkbox_iterate_batch, prompt_position, prompt_txt: str):
++        lines = [x for x in (x.strip() for x in prompt_txt.splitlines()) if x]
++
++        p.do_not_save_grid = True
++
++        job_count = 0
++        jobs = []
++
++        for line in lines:
++            if "--" in line:
++                try:
++                    args = cmdargs(line)
++                except Exception:
++                    errors.report(f"Error parsing line {line} as commandline", exc_info=True)
++                    args = {"prompt": line}
++            else:
++                args = {"prompt": line}
++
++            job_count += args.get("n_iter", p.n_iter)
++
++            jobs.append(args)
++
++        print(f"Will process {len(lines)} lines in {job_count} jobs.")
++        if (checkbox_iterate or checkbox_iterate_batch) and p.seed == -1:
++            p.seed = int(random.randrange(4294967294))
++
++        state.job_count = job_count
++
++        images = []
++        all_prompts = []
++        infotexts = []
++        for args in jobs:
++            state.job = f"{state.job_no + 1} out of {state.job_count}"
++
++            copy_p = copy.copy(p)
++            for k, v in args.items():
++                if k == "sd_model":
++                    copy_p.override_settings['sd_model_checkpoint'] = v
++                else:
++                    setattr(copy_p, k, v)
++
++            if args.get("prompt") and p.prompt:
++                if prompt_position == "start":
++                    copy_p.prompt = args.get("prompt") + " " + p.prompt
++                else:
++                    copy_p.prompt = p.prompt + " " + args.get("prompt")
++
++            if args.get("negative_prompt") and p.negative_prompt:
++                if prompt_position == "start":
++                    copy_p.negative_prompt = args.get("negative_prompt") + " " + p.negative_prompt
++                else:
++                    copy_p.negative_prompt = p.negative_prompt + " " + args.get("negative_prompt")
++
++            proc = process_images(copy_p)
++            images += proc.images
++
++            if checkbox_iterate:
++                p.seed = p.seed + (p.batch_size * p.n_iter)
++            all_prompts += proc.all_prompts
++            infotexts += proc.infotexts
++
++        return Processed(p, images, p.seed, "", all_prompts=all_prompts, infotexts=infotexts)

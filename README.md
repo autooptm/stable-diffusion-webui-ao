@@ -1,3 +1,63 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>stable-diffusion-webui · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>1.77x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-1.77x-2ea44f"></a>
+    <a href="https://github.com/AUTOMATIC1111/stable-diffusion-webui/commit/82a973c04367123ae98bd9abdf80d9eda9b910e2"><img alt="base" src="https://img.shields.io/badge/upstream-82a973c04367-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090%20D-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [AUTOMATIC1111/stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) at commit
+> [`82a973c04367`](https://github.com/AUTOMATIC1111/stable-diffusion-webui/commit/82a973c04367123ae98bd9abdf80d9eda9b910e2) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python launch.py --api --nowebui` |
+| **Entry point** | `launch.py` (the API server) |
+| **Unit measured** | one txt2img request to the running server, from JSON payload to PNG in the response: SD 1.5 (`v1-5-pruned-emaonly`, fp16 as shipped), 20 steps DPM++ 2M Karras, CFG 7. 24 requests in a fixed mix (16× 512×512, 4× 512×768, 4× 768×512) sent through the repository's own "Prompts from file or textbox" script, after 2 warm-up requests |
+| **Before (stock)** | 1,418 ms per request (33.4 s in the timed request loop) |
+| **After (this tree, all switches default ON)** | 755 ms per request (18.9 s in the timed request loop; server startup, 10.6 s for stock and 12.3 s for this tree, is not included) |
+| **Speedup** | **1.77x** end to end on RTX 4090 D (1.88x on the per-request mean), noise floor of the host 1.3% |
+| **Output** | every decoded image at PSNR 48.2 dB against the stock server's (worst 1% of pixels trimmed, those within 6/255 levels; 0.01% of pixels differ by more than 64/255); 51.6 dB on held-out requests at sizes the optimiser never saw |
+
+### What changed
+
+| File | Where | Gain |
+|---|---|---|
+| `modules/sd_hijack_optimizations.py` | SdOptimizationSdp.priority | 1.398x |
+| `modules/api/api.py` | encode_pil_to_base64() | 1.117x |
+| `modules/sd_opt.py` | new class | 1.116x |
+| `modules/sd_opt.py` | apply() (new) | 1.046x |
+| `modules/sd_hijack.py` | hijack() / undo_hijack() | — |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/stable-diffusion-webui-ao.git
+cd stable-diffusion-webui-ao
+# set up exactly as upstream documents (the SD 1.5 checkpoint in models/Stable-diffusion/), then:
+python launch.py --api --nowebui
+# and send txt2img requests to http://127.0.0.1:7861/sdapi/v1/txt2img
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff 82a973c04367` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 # Stable Diffusion web UI
 A web interface for Stable Diffusion, implemented using Gradio library.
 

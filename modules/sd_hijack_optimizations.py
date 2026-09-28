@@ -9,7 +9,7 @@ from torch import einsum
 from ldm.util import default
 from einops import rearrange
 
-from modules import shared, errors, devices, sub_quadratic_attention
+from modules import shared, errors, devices, sub_quadratic_attention, sd_opt
 from modules.hypernetworks import hypernetwork
 
 import ldm.modules.attention
@@ -83,7 +83,10 @@ class SdOptimizationSdp(SdOptimizationSdpNoMem):
     name = "sdp"
     label = "scaled dot product"
     cmd_opt = "opt_sdp_attention"
-    priority = 70
+
+    @property
+    def priority(self):
+        return 95 if torch.cuda.is_available() and sd_opt.enabled("OPT_1") else 70
 
     def apply(self):
         ldm.modules.attention.CrossAttention.forward = scaled_dot_product_attention_forward
